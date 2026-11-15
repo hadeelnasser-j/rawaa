@@ -559,14 +559,17 @@ function setup() {
     output: [ {id:"ndvi",bands:1,sampleType:"FLOAT32"}, {id:"ndmi",bands:1,sampleType:"FLOAT32"},
               {id:"ndwi",bands:1,sampleType:"FLOAT32"}, {id:"savi",bands:1,sampleType:"FLOAT32"},
               {id:"ndre",bands:1,sampleType:"FLOAT32"}, {id:"salinity",bands:1,sampleType:"FLOAT32"},
-              {id:"dataMask",bands:1} ] };
+              {id:"valid",bands:1,sampleType:"FLOAT32"}, {id:"dataMask",bands:1} ] };
 }
 function nd(a,b){ return (a+b)!==0 ? (a-b)/(a+b) : 0; }
 function evaluatePixel(s) {
   let good = s.dataMask===1 && ![0,1,3,6,8,9,10,11].includes(s.SCL);
+  // dataMask = pixel inside the park polygon; masked (cloud etc.) pixels return NaN so they are excluded
+  // from index statistics, while "valid" gives the clear-sky share of the park itself.
+  let N = NaN;
   let savi = (s.B08+s.B04+0.5)!==0 ? 1.5*(s.B08-s.B04)/(s.B08+s.B04+0.5) : 0;
-  return {ndvi:[nd(s.B08,s.B04)], ndmi:[nd(s.B08,s.B11)], ndwi:[nd(s.B03,s.B08)], savi:[savi],
-          ndre:[nd(s.B8A,s.B05)], salinity:[Math.sqrt(Math.max(0,s.B02*s.B04))], dataMask:[good?1:0]};
+  return {ndvi:[good?nd(s.B08,s.B04):N], ndmi:[good?nd(s.B08,s.B11):N], ndwi:[good?nd(s.B03,s.B08):N], savi:[good?savi:N],
+          ndre:[good?nd(s.B8A,s.B05):N], salinity:[good?Math.sqrt(Math.max(0,s.B02*s.B04)):N], valid:[good?1:0], dataMask:[s.dataMask]};
 }
 '''
 
@@ -723,10 +726,15 @@ def sync_satellite(area_id:int,v:Sync,req:Request):
             ext={k:outputs.get(k,{}).get('bands',{}).get('B0',{}).get('stats',{}).get('mean') for k in ('ndwi','savi','ndre','salinity')}
             ext={k:(round(x,5) if isinstance(x,(int,float)) and math.isfinite(x) else None) for k,x in ext.items()}
             std=v1.get('stDev');std=round(std,5) if isinstance(std,(int,float)) and math.isfinite(std) else None
-            count=v1.get('sampleCount',0);nodata=v1.get('noDataCount',count)
-            pct=(count-nodata)/count*100 if count else 0
+            vm=outputs.get('valid',{}).get('bands',{}).get('B0',{}).get('stats',{}).get('mean')
+            if isinstance(vm,(int,float)) and math.isfinite(vm):
+                pct=vm*100  # clear-sky share of pixels inside the park polygon
+            else:
+                count=v1.get('sampleCount',0);nodata=v1.get('noDataCount',count)
+                pct=(count-nodata)/count*100 if count else 0
             vi=v1.get('mean');mi=v2.get('mean')
-            if vi is None or pct<60:
+            if not (isinstance(mi,(int,float)) and math.isfinite(mi)): mi=None
+            if not (isinstance(vi,(int,float)) and math.isfinite(vi)) or pct<60:
                 skipped+=1;continue
             dt=item['interval']['from'][:10]
             db.execute('''INSERT INTO observations(area_id,measured_at,ndvi,ndmi,ndwi,savi,ndre,salinity,ndvi_std,valid_pixels_pct,source,is_demo,created_at)
