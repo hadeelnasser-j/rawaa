@@ -153,26 +153,65 @@ def init_db():
 
 init_db()
 
-# Field-validation sites supplied by the team (Google Maps pins). Boundaries are an approximate
-# ~200 x 150 m rectangle around each pin until the real park outline is drawn. No synthetic readings
-# are attached: these sites only show what Copernicus Sentinel-2 actually returns.
-VALIDATION_SITES = [
-    ('موقع التحقق ١','Validation site 1',21.5492043,39.2089827),
-    ('موقع التحقق ٢','Validation site 2',21.6531027,39.1083515),
-    ('حديقة الأجواد الجديدة','Al Ajwad New Park',21.5950333,39.2533068),
+# Real Jeddah sites. Boundaries marked "OSM" come from OpenStreetMap (© OpenStreetMap contributors, ODbL);
+# "approx" boundaries are a ~200 x 150 m rectangle around the Google Maps pin until the real outline is drawn.
+# No synthetic readings are attached to any of them: they only show what Copernicus Sentinel-2 returns.
+OSM_RINGS = {"majid":[[39.181215,21.590235],[39.181659,21.589014],[39.185624,21.590207],[39.18501,21.592798],[39.184919,21.592876],[39.184829,21.592905],[39.183348,21.592545],[39.183229,21.59248],[39.181239,21.590371],[39.181215,21.590235]],"corniche":[[39.149704,21.522834],[39.149701,21.522635],[39.149728,21.522507],[39.150007,21.522122],[39.150252,21.521875],[39.150361,21.521794],[39.150511,21.521727],[39.15119,21.521505],[39.1513,21.521436],[39.151355,21.521365],[39.152012,21.519627],[39.152167,21.519267],[39.152226,21.519043],[39.152665,21.518426],[39.152866,21.518173],[39.152661,21.517818],[39.153044,21.516969],[39.15364,21.517187],[39.150853,21.523589],[39.150784,21.523905],[39.150796,21.524127],[39.150865,21.524408],[39.150988,21.524639],[39.151063,21.524735],[39.151344,21.525055],[39.151745,21.525448],[39.152315,21.525915],[39.152683,21.526192],[39.153174,21.526532],[39.15318,21.526572],[39.154136,21.527167],[39.154175,21.527159],[39.155497,21.527946],[39.15551,21.527984],[39.156067,21.528322],[39.156757,21.528705],[39.15676,21.528733],[39.157332,21.52898],[39.157876,21.529191],[39.157913,21.529185],[39.158147,21.529302],[39.158218,21.52935],[39.15838,21.529504],[39.158473,21.529635],[39.158575,21.529869],[39.158598,21.530067],[39.158183,21.530166],[39.158177,21.530225],[39.158098,21.530279],[39.157992,21.530266],[39.157987,21.530181],[39.157848,21.530187],[39.157835,21.530156],[39.157693,21.530124],[39.157425,21.530129],[39.156471,21.5302],[39.156411,21.530065],[39.156376,21.530081],[39.156225,21.529772],[39.156244,21.529761],[39.155648,21.528975],[39.155386,21.528813],[39.154762,21.528285],[39.15467,21.528175],[39.154682,21.528159],[39.154422,21.527936],[39.154206,21.527785],[39.154218,21.527762],[39.153956,21.527563],[39.153712,21.527413],[39.153724,21.527378],[39.153404,21.527125],[39.153234,21.526961],[39.153249,21.52694],[39.153078,21.526819],[39.152998,21.52672],[39.152918,21.526672],[39.152932,21.526653],[39.152803,21.526578],[39.152713,21.526461],[39.152591,21.526382],[39.152607,21.526356],[39.151663,21.525752],[39.151595,21.525482],[39.151556,21.525437],[39.151137,21.525127],[39.151104,21.525066],[39.151104,21.524996],[39.151077,21.524977],[39.151101,21.524953],[39.150889,21.524781],[39.150828,21.524693],[39.150843,21.524666],[39.150713,21.5245],[39.150717,21.524466],[39.150605,21.524402],[39.150529,21.524337],[39.150493,21.524193],[39.150531,21.523837],[39.150511,21.523778],[39.150104,21.523056],[39.149763,21.522898],[39.149704,21.522834]],"saja":[[39.185792,21.527631],[39.185831,21.527557],[39.185896,21.527514],[39.18683,21.527534],[39.186851,21.527514],[39.186968,21.524557],[39.188075,21.524599],[39.187865,21.528056],[39.187851,21.528091],[39.187817,21.52811],[39.187524,21.528072],[39.185896,21.527783],[39.185842,21.527749],[39.185803,21.527685],[39.185792,21.527631]],"tihamah":[[39.208188,21.54982],[39.208477,21.548486],[39.209049,21.548591],[39.209059,21.548697],[39.209095,21.548739],[39.209153,21.54876],[39.209242,21.548736],[39.209301,21.548638],[39.209885,21.548747],[39.209599,21.550091],[39.208188,21.54982]],"ajwad":[[39.252292,21.59362],[39.252354,21.592868],[39.2525,21.592229],[39.252517,21.592047],[39.252494,21.591656],[39.25255,21.5916],[39.252588,21.591598],[39.25338,21.591739],[39.253421,21.591784],[39.253433,21.591852],[39.253168,21.592939],[39.253155,21.593271],[39.25318,21.59345],[39.25329,21.59381],[39.253533,21.594281],[39.253781,21.594687],[39.253946,21.595058],[39.254068,21.595391],[39.254181,21.595872],[39.254213,21.596361],[39.254187,21.596388],[39.253942,21.596309],[39.253429,21.595899],[39.25303,21.595438],[39.252717,21.595013],[39.252377,21.594372],[39.252292,21.59362]]}
+
+def _poly(key=None, lat=None, lng=None):
+    if key: return {'type':'Polygon','coordinates':[OSM_RINGS[key]]}
+    return square(lng,lat,0.001)
+
+# (name_en key, name_ar, category, role_ar, role_en, geometry, boundary source)
+REAL_SITES = [
+    # Five case-study parks (one per case type in the project plan)
+    ('Prince Majid Park','حديقة الأمير ماجد','Case study',
+     'حالة ١ · حديقة مرجعية ممتازة: شكل NDVI الطبيعي (حي الربوة، نحو ٨ كم من البحر)',
+     'Case 1 · Excellent reference park: normal NDVI shape (Ar Rabwah, ~8 km from the sea)',_poly('majid'),'OSM way 1074269189'),
+    ('Al Huda Garden','حديقة الهدى','Case study',
+     'حالة ٢ · مرشّحة لإجهاد مائي/موت نباتات (حي المروة). الترشيح من تقييمات الزوار العامة ويحتاج تأكيد الأمانة',
+     'Case 2 · Candidate water stress / plant loss (Al Marwah). Based on public visitor reviews; needs municipality confirmation',_poly(lat=21.6105335,lng=39.2171712),'approx'),
+    ('Middle Corniche Park','حديقة الكورنيش الأوسط','Case study',
+     'حالة ٣ · ساحلية ملاصقة للبحر: اختبار الملوحة (حي الحمراء)',
+     'Case 3 · Coastal, on the seafront: salinity test (Al Hamra)',_poly('corniche'),'OSM way 628514686'),
+    ('Al Saja Gardens','حدائق السجى','Case study',
+     'حالة ٤ · داخلية على نفس خط العرض وتبعد نحو ٤ كم عن البحر: شاهد (Control) للحالة ٣ (حي الشرفية)',
+     'Case 4 · Inland at the same latitude, ~4 km from the sea: control for case 3 (Ash Sharafiyah)',_poly('saja'),'OSM way 165769855'),
+    ('Abruq Al-Rughamah Garden','حديقة أبرق الرغامة','Case study',
+     'حالة ٥ · مرشّحة لإجهاد حيوي/تشبع مائي وإهمال (حي أبرق الرغامة). الترشيح من تقييمات الزوار العامة ويحتاج تأكيد الأمانة',
+     'Case 5 · Candidate biotic stress / waterlogging and neglect (Abruq Al-Rughamah). Based on public reviews; needs municipality confirmation',_poly(lat=21.5008814,lng=39.2719418),'approx'),
+    # Field-validation sites supplied by the team, to compare with the municipality's own records
+    ('Validation site 1','حديقة تهامة — موقع التحقق ١','Validation site',
+     'موقع تحقق للمقارنة مع نتائج الأمانة (حي العزيزية)','Validation site for comparison with municipality results (Al Aziziyah)',_poly('tihamah'),'OSM way 628578775'),
+    ('Validation site 2','موقع التحقق ٢','Validation site',
+     'موقع تحقق للمقارنة مع نتائج الأمانة (حي الشاطئ، قرب الساحل)','Validation site for comparison with municipality results (Ash Shati, near the coast)',_poly(lat=21.6531027,lng=39.1083515),'approx'),
+    ('Al Ajwad New Park','حديقة الأجواد الجديدة','Validation site',
+     'موقع تحقق للمقارنة مع نتائج الأمانة (حي الأجواد)','Validation site for comparison with municipality results (Al Ajwad)',_poly('ajwad'),'OSM way 1491780911'),
 ]
+SITE_INFO = {r[0]:{'role_ar':r[3],'role_en':r[4],'boundary_source':r[6]} for r in REAL_SITES}
 
 def ensure_validation_sites():
     with connect() as db:
-        for ar,en,lat,lng in VALIDATION_SITES:
-            if db.execute('SELECT 1 FROM areas WHERE name_en=?',(en,)).fetchone():
+        for en,ar,cat,_ra,_re,geom,src in REAL_SITES:
+            row=db.execute('SELECT id FROM areas WHERE name_en=?',(en,)).fetchone()
+            if row:
+                db.execute('UPDATE areas SET name_ar=?,category=?,geometry=? WHERE id=?',(ar,cat,json.dumps(geom),row[0]))
                 continue
             db.execute('INSERT INTO areas(name_ar,name_en,category,assigned_operator,geometry,irrigation,plants,planting_date,demo,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-                (ar,en,'Validation site',2,json.dumps(square(lng,lat,0.001)),'','',None,0,utcnow()))
+                (ar,en,cat,2,json.dumps(geom),'','',None,0,utcnow()))
             db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES (?,?,?,?,?)',
-                (1,'seed','area',f'Validation site added: {en} ({lat:.5f}, {lng:.5f}) - approximate boundary',utcnow()))
+                (1,'seed','area',f'{cat} added: {en} - boundary: {src}',utcnow()))
 
 ensure_validation_sites()
+
+EXTRA_INDEX_COLUMNS = ('ndwi','savi','ndre','salinity','ndvi_std')
+def migrate_spectral_columns():
+    with connect() as db:
+        have={r[1] for r in db.execute('PRAGMA table_info(observations)')}
+        for col in EXTRA_INDEX_COLUMNS:
+            if col not in have: db.execute(f'ALTER TABLE observations ADD COLUMN {col} REAL')
+
+migrate_spectral_columns()
 
 
 def current_user(req: Request):
@@ -203,7 +242,7 @@ def in_scope_clause(user, alias='a'):
 
 
 def metrics(area_id, db):
-    rows=[dict(r) for r in db.execute('SELECT measured_at,ndvi,ndmi,valid_pixels_pct,source,is_demo FROM observations WHERE area_id=? ORDER BY measured_at', (area_id,))]
+    rows=[dict(r) for r in db.execute('SELECT measured_at,ndvi,ndmi,ndwi,savi,ndre,salinity,ndvi_std,valid_pixels_pct,source,is_demo FROM observations WHERE area_id=? ORDER BY measured_at', (area_id,))]
     real=[r for r in rows if not r['is_demo'] and r['ndvi'] is not None]
     series=real if real else [r for r in rows if r['is_demo']]
     quality=[r for r in series if r['valid_pixels_pct'] >= 60]
@@ -235,6 +274,7 @@ def full_area(db,r):
     d=dict(r)
     d['geometry']=json.loads(d['geometry'])
     d['metrics']=metrics(d['id'],db)
+    d.update(SITE_INFO.get(d['name_en'],{}))
     return d
 
 class Login(BaseModel):
@@ -483,19 +523,50 @@ def export_tasks(req:Request):
     writer=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore');writer.writeheader();writer.writerows(rows)
     return Response(out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="rawaa-tasks.csv"'})
 
+# Months in the approved maintenance programme (Appendix 6) with work that can briefly lower NDVI
+# (pruning, frond/offshoot removal, lawn aeration/de-thatching/top dressing, annuals replacement) or raise it (fertiliser).
+MAINT_DROP_MONTHS = {1,2,3,5,9,10,11,12}
+MAINT_FERT_MONTHS = {1,3,5,9,11}
+
+@app.get('/api/reports/dataset.csv')
+def export_dataset(req:Request, include_demo:int=0):
+    """Per-site monthly spectral features for analysis / model training. Real Sentinel-2 rows only by default."""
+    u=current_user(req);require_regulator(u)
+    with connect() as db:
+        areas={r['id']:dict(r) for r in db.execute('SELECT * FROM areas')}
+        rows=[dict(r) for r in db.execute('SELECT * FROM observations ORDER BY area_id,measured_at')]
+    out=io.StringIO()
+    fields=['area_id','name_en','name_ar','category','role_en','boundary_source','lat','lng','date','month',
+            'ndvi','ndvi_std','ndmi','ndwi','savi','ndre','salinity','valid_pixels_pct','maint_drop_month','maint_fert_month','source','is_demo']
+    w=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore');w.writeheader()
+    for r in rows:
+        if r['is_demo'] and not include_demo: continue
+        a=areas.get(r['area_id']);
+        if not a: continue
+        ring=json.loads(a['geometry'])['coordinates'][0]
+        xs=[float(p[0]) for p in ring];ys=[float(p[1]) for p in ring]
+        m=int(r['measured_at'][5:7]);info=SITE_INFO.get(a['name_en'],{})
+        w.writerow({**r,'name_en':a['name_en'],'name_ar':a['name_ar'],'category':a['category'],'role_en':info.get('role_en',''),
+                    'boundary_source':info.get('boundary_source',''),'lat':round((min(ys)+max(ys))/2,6),'lng':round((min(xs)+max(xs))/2,6),
+                    'date':r['measured_at'],'month':m,'maint_drop_month':int(m in MAINT_DROP_MONTHS),'maint_fert_month':int(m in MAINT_FERT_MONTHS)})
+    return Response('\ufeff'+out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="rawaa-training-dataset.csv"'})
+
 # --- Copernicus Data Space — Sentinel Hub Statistical API, optional OAuth integration ---
 EVALSCRIPT = '''//VERSION=3
+// Monthly spectral features for each site (cloud/shadow/water masked by SCL: keep vegetation 4 and bare soil 5).
 function setup() {
-  return { input: [{bands:["B04","B08","B11","SCL","dataMask"], units:"REFLECTANCE"}],
-    output: [ {id:"ndvi",bands:1,sampleType:"FLOAT32"},
-              {id:"ndmi",bands:1,sampleType:"FLOAT32"},
+  return { input: [{bands:["B02","B03","B04","B05","B08","B8A","B11","SCL","dataMask"], units:"REFLECTANCE"}],
+    output: [ {id:"ndvi",bands:1,sampleType:"FLOAT32"}, {id:"ndmi",bands:1,sampleType:"FLOAT32"},
+              {id:"ndwi",bands:1,sampleType:"FLOAT32"}, {id:"savi",bands:1,sampleType:"FLOAT32"},
+              {id:"ndre",bands:1,sampleType:"FLOAT32"}, {id:"salinity",bands:1,sampleType:"FLOAT32"},
               {id:"dataMask",bands:1} ] };
 }
+function nd(a,b){ return (a+b)!==0 ? (a-b)/(a+b) : 0; }
 function evaluatePixel(s) {
   let good = s.dataMask===1 && [4,5].includes(s.SCL);
-  let vi = (s.B08+s.B04)>0 ? (s.B08-s.B04)/(s.B08+s.B04) : 0;
-  let mi = (s.B08+s.B11)>0 ? (s.B08-s.B11)/(s.B08+s.B11) : 0;
-  return {ndvi:[vi],ndmi:[mi],dataMask:[good?1:0]};
+  let savi = (s.B08+s.B04+0.5)!==0 ? 1.5*(s.B08-s.B04)/(s.B08+s.B04+0.5) : 0;
+  return {ndvi:[nd(s.B08,s.B04)], ndmi:[nd(s.B08,s.B11)], ndwi:[nd(s.B03,s.B08)], savi:[savi],
+          ndre:[nd(s.B8A,s.B05)], salinity:[Math.sqrt(Math.max(0,s.B02*s.B04))], dataMask:[good?1:0]};
 }
 '''
 
@@ -541,9 +612,23 @@ function evaluatePixel(s){
   return [0.74,0.19,0.17,0.85];
 }
 """
+_MASK = "if(s.dataMask===0 || [0,1,3,8,9,10,11].includes(s.SCL)) return [0,0,0,0];"
+def _layer_script(bands, body):
+    return ("//VERSION=3\nfunction setup(){return {input:[{bands:%s,units:'REFLECTANCE'}],output:{bands:4}}}\n"
+            "function nd(a,b){return (a+b)!==0?(a-b)/(a+b):0}\n"
+            "function evaluatePixel(s){%s %s}" % (json.dumps(bands+['SCL','dataMask']), _MASK, body))
+LAYER_SCRIPTS = {
+  'false_color': _layer_script(['B08','B04','B03'], "return [Math.min(1,2.5*s.B08),Math.min(1,2.5*s.B04),Math.min(1,2.5*s.B03),1];"),
+  'urban': _layer_script(['B12','B11','B04'], "return [Math.min(1,2.5*s.B12),Math.min(1,2.5*s.B11),Math.min(1,2.5*s.B04),1];"),
+  'swir': _layer_script(['B12','B8A','B04'], "return [Math.min(1,2.5*s.B12),Math.min(1,2.5*s.B8A),Math.min(1,2.5*s.B04),1];"),
+  'moisture': _layer_script(['B8A','B11'], "let v=nd(s.B8A,s.B11);let c=colorBlend(v,[-0.8,-0.24,-0.032,0.032,0.24,0.8],[[0.5,0,0],[1,0,0],[1,1,0],[0,1,1],[0,0,1],[0,0,0.5]]);return [c[0],c[1],c[2],0.85];"),
+  'ndwi': _layer_script(['B03','B08'], "let v=nd(s.B03,s.B08);let c=colorBlend(v,[-0.8,-0.3,0,0.2,0.5],[[0,0.4,0],[0.6,0.8,0.4],[1,1,1],[0.3,0.6,1],[0,0,0.6]]);return [c[0],c[1],c[2],0.85];"),
+  'ndre': _layer_script(['B8A','B05'], "let v=nd(s.B8A,s.B05);let c=colorBlend(v,[0,0.15,0.3,0.45,0.6],[[0.74,0.19,0.17],[0.9,0.44,0.15],[0.92,0.77,0.23],[0.27,0.71,0.36],[0.08,0.5,0.23]]);return [c[0],c[1],c[2],0.85];"),
+}
+
 class ImageryRequest(BaseModel):
     month:str=Field(pattern=r'^\d{4}-(0[1-9]|1[0-2])$')
-    layer:str=Field(pattern=r'^(true_color|ndvi)$')
+    layer:str=Field(pattern=r'^(true_color|false_color|ndvi|moisture|ndwi|swir|urban|ndre)$')
 
 def _copernicus_access_token():
     ident=os.getenv('COPERNICUS_CLIENT_ID')
@@ -595,7 +680,7 @@ def satellite_image(area_id:int,v:ImageryRequest,req:Request):
       'input':{'bounds':{'bbox':bbox,'geometry':geom,'properties':{'crs':'http://www.opengis.net/def/crs/OGC/1.3/CRS84'}},
                 'data':[{'type':'sentinel-2-l2a','dataFilter':{'timeRange':{'from':period.isoformat()+'T00:00:00Z','to':end.isoformat()+'T23:59:59Z'},'mosaickingOrder':'leastCC'}}]},
       'output':{'width':512,'height':512,'responses':[{'identifier':'default','format':{'type':'image/png'}}]},
-      'evalscript':NDVI_IMAGE_SCRIPT if v.layer=='ndvi' else TRUE_COLOR_SCRIPT}
+      'evalscript':NDVI_IMAGE_SCRIPT if v.layer=='ndvi' else TRUE_COLOR_SCRIPT if v.layer=='true_color' else LAYER_SCRIPTS[v.layer]}
     try:
         token=_copernicus_access_token()
         data=_process_image(payload,token)
@@ -635,17 +720,21 @@ def sync_satellite(area_id:int,v:Sync,req:Request):
             outputs=item.get('outputs',{})
             v1=outputs.get('ndvi',{}).get('bands',{}).get('B0',{}).get('stats',{})
             v2=outputs.get('ndmi',{}).get('bands',{}).get('B0',{}).get('stats',{})
+            ext={k:outputs.get(k,{}).get('bands',{}).get('B0',{}).get('stats',{}).get('mean') for k in ('ndwi','savi','ndre','salinity')}
+            ext={k:(round(x,5) if isinstance(x,(int,float)) and math.isfinite(x) else None) for k,x in ext.items()}
+            std=v1.get('stDev');std=round(std,5) if isinstance(std,(int,float)) and math.isfinite(std) else None
             count=v1.get('sampleCount',0);nodata=v1.get('noDataCount',count)
             pct=(count-nodata)/count*100 if count else 0
             vi=v1.get('mean');mi=v2.get('mean')
             if vi is None or pct<60:
                 skipped+=1;continue
             dt=item['interval']['from'][:10]
-            db.execute('''INSERT INTO observations(area_id,measured_at,ndvi,ndmi,valid_pixels_pct,source,is_demo,created_at)
-                VALUES(?,?,?,?,?,'Copernicus Sentinel-2 L2A',0,?)
+            db.execute('''INSERT INTO observations(area_id,measured_at,ndvi,ndmi,ndwi,savi,ndre,salinity,ndvi_std,valid_pixels_pct,source,is_demo,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,'Copernicus Sentinel-2 L2A',0,?)
                 ON CONFLICT(area_id,measured_at,source) DO UPDATE SET
-                ndvi=excluded.ndvi,ndmi=excluded.ndmi,valid_pixels_pct=excluded.valid_pixels_pct''',
-                (area_id,dt,round(vi,5),round(mi,5) if mi is not None else None,round(pct,1),utcnow()))
+                ndvi=excluded.ndvi,ndmi=excluded.ndmi,ndwi=excluded.ndwi,savi=excluded.savi,ndre=excluded.ndre,
+                salinity=excluded.salinity,ndvi_std=excluded.ndvi_std,valid_pixels_pct=excluded.valid_pixels_pct''',
+                (area_id,dt,round(vi,5),round(mi,5) if mi is not None else None,ext['ndwi'],ext['savi'],ext['ndre'],ext['salinity'],std,round(pct,1),utcnow()))
             saved+=1
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
                    (u['id'],'satellite_sync',str(area_id),f'{saved} periods, {skipped} excluded',utcnow()))
