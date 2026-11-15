@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import io
 import json
+import re
 import math
 import os
 import secrets
@@ -633,7 +634,18 @@ class ImageryRequest(BaseModel):
     month:str=Field(pattern=r'^\d{4}-(0[1-9]|1[0-2])$')
     layer:str=Field(pattern=r'^(true_color|false_color|ndvi|moisture|ndwi|swir|urban|ndre)$')
 
+_TOKEN_CACHE={'value':None,'expires':0.0}
+_TOKEN_LOCK=threading.Lock()
+
 def _copernicus_access_token():
+    with _TOKEN_LOCK:
+        if _TOKEN_CACHE['value'] and time.time()<_TOKEN_CACHE['expires']:
+            return _TOKEN_CACHE['value']
+        tok=_fetch_copernicus_token()
+        _TOKEN_CACHE.update(value=tok,expires=time.time()+480)  # CDSE tokens live ~10 min
+        return tok
+
+def _fetch_copernicus_token():
     ident=os.getenv('COPERNICUS_CLIENT_ID')
     secret=os.getenv('COPERNICUS_CLIENT_SECRET')
     if not ident or not secret:
@@ -692,6 +704,69 @@ def satellite_image(area_id:int,v:ImageryRequest,req:Request):
     return {'image_data_url':'data:image/png;base64,'+base64.b64encode(data).decode('ascii'),
             'bounds':bbox,'month':v.month,'capture_date':None,'period_start':period.isoformat(),'period_end':end.isoformat(),'layer':v.layer,'provider':'Copernicus Data Space Sentinel Hub Process API',
             'note':'True Sentinel-2 L2A composite for requested period; not a single dated acquisition.'}
+
+# --- Copernicus Browser-style basemap: Sentinel-2 L2A XYZ tiles rendered through the Process API ---
+# Whole-scene rendering (clouds visible, like Copernicus Browser), restricted to the Jeddah region to protect quota.
+def _map_script(bands, body):
+    return ("//VERSION=3\nfunction setup(){return {input:[{bands:%s}],output:{bands:4}}}\n"
+            "function nd(a,b){return (a+b)!==0?(a-b)/(a+b):0}\n"
+            "function evaluatePixel(s){if(s.dataMask===0)return [0,0,0,0]; %s}" % (json.dumps(bands+['dataMask']), body))
+_G=lambda b:'Math.min(1,2.5*s.%s)'%b
+MAP_SCRIPTS={
+  'true_color': _map_script(['B04','B03','B02'], f"return [{_G('B04')},{_G('B03')},{_G('B02')},1];"),
+  'false_color': _map_script(['B08','B04','B03'], f"return [{_G('B08')},{_G('B04')},{_G('B03')},1];"),
+  'urban': _map_script(['B12','B11','B04'], f"return [{_G('B12')},{_G('B11')},{_G('B04')},1];"),
+  'swir': _map_script(['B12','B8A','B04'], f"return [{_G('B12')},{_G('B8A')},{_G('B04')},1];"),
+  'ndvi': _map_script(['B04','B08'], "let v=nd(s.B08,s.B04);let c=colorBlend(v,[-0.5,-0.2,0,0.025,0.05,0.075,0.1,0.125,0.15,0.175,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,1],"
+     "[[0.75,0.75,0.75],[0.86,0.86,0.86],[1,1,0.88],[1,0.98,0.8],[0.93,0.91,0.71],[0.87,0.85,0.61],[0.8,0.78,0.51],[0.74,0.72,0.42],[0.69,0.76,0.38],[0.64,0.8,0.35],"
+     "[0.57,0.75,0.32],[0.5,0.7,0.28],[0.44,0.64,0.25],[0.38,0.59,0.21],[0.31,0.54,0.18],[0.25,0.49,0.14],[0.19,0.43,0.11],[0.13,0.38,0.07],[0.06,0.33,0.04],[0,0.27,0]]);return [c[0],c[1],c[2],1];"),
+  'ndre': _map_script(['B8A','B05'], "let v=nd(s.B8A,s.B05);let c=colorBlend(v,[0,0.15,0.3,0.45,0.6],[[0.74,0.19,0.17],[0.9,0.44,0.15],[0.92,0.77,0.23],[0.27,0.71,0.36],[0.08,0.5,0.23]]);return [c[0],c[1],c[2],1];"),
+  'moisture': _map_script(['B8A','B11'], "let v=nd(s.B8A,s.B11);let c=colorBlend(v,[-0.8,-0.24,-0.032,0.032,0.24,0.8],[[0.5,0,0],[1,0,0],[1,1,0],[0,1,1],[0,0,1],[0,0,0.5]]);return [c[0],c[1],c[2],1];"),
+  'ndwi': _map_script(['B03','B08'], "let v=nd(s.B03,s.B08);let c=colorBlend(v,[-0.8,-0.3,0,0.2,0.5],[[0,0.4,0],[0.6,0.8,0.4],[1,1,1],[0.3,0.6,1],[0,0,0.6]]);return [c[0],c[1],c[2],1];"),
+}
+TILE_REGION=(38.95,21.15,39.45,21.95)   # lon/lat box around Jeddah
+TILE_DIR=Path(os.getenv('RAWAA_TILE_CACHE','/tmp/rawaa-tiles'))
+_EMPTY_PNG=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4XmNgYGBgAAAABQABGWkDzwAAAABJRU5ErkJggg==')
+_O=20037508.342789244
+
+def _tile_bounds(z,x,y):
+    size=2*_O/(2**z);minx=-_O+x*size;maxy=_O-y*size
+    return [minx,maxy-size,minx+size,maxy]
+
+def _merc_to_lonlat(mx,my):
+    return mx/_O*180, math.degrees(2*math.atan(math.exp(my/_O*math.pi))-math.pi/2)
+
+@app.get('/api/tiles/{layer}/{z}/{x}/{y}.png')
+def sentinel_tile(layer:str,z:int,x:int,y:int,req:Request,month:str='',cc:int=30):
+    current_user(req)
+    if layer not in MAP_SCRIPTS: raise HTTPException(404,'Unknown layer')
+    if not (9<=z<=17) or not (0<=x<2**z and 0<=y<2**z): raise HTTPException(404,'Zoom out of range')
+    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',month or ''): raise HTTPException(400,'month=YYYY-MM required')
+    cc=max(0,min(100,int(cc)))
+    period=date.fromisoformat(month+'-01')
+    if period>date.today().replace(day=1) or period.year<2017: raise HTTPException(400,'Month out of range')
+    b=_tile_bounds(z,x,y);w,s_=_merc_to_lonlat(b[0],b[1]);e,n=_merc_to_lonlat(b[2],b[3])
+    hdr={'Cache-Control':'private, max-age=86400'}
+    if e<TILE_REGION[0] or w>TILE_REGION[2] or n<TILE_REGION[1] or s_>TILE_REGION[3]:
+        return Response(_EMPTY_PNG,media_type='image/png',headers=hdr)
+    path=TILE_DIR/layer/month/str(cc)/str(z)/str(x)/f'{y}.png'
+    if path.exists(): return Response(path.read_bytes(),media_type='image/png',headers=hdr)
+    next_month=(period.replace(day=28)+timedelta(days=4)).replace(day=1)
+    end=min(date.today(),next_month-timedelta(days=1))
+    payload={'input':{'bounds':{'bbox':b,'properties':{'crs':'http://www.opengis.net/def/crs/EPSG/0/3857'}},
+             'data':[{'type':'sentinel-2-l2a','dataFilter':{'timeRange':{'from':period.isoformat()+'T00:00:00Z','to':end.isoformat()+'T23:59:59Z'},
+                      'mosaickingOrder':'leastCC','maxCloudCoverage':cc}}]},
+             'output':{'width':256,'height':256,'responses':[{'identifier':'default','format':{'type':'image/png'}}]},
+             'evalscript':MAP_SCRIPTS[layer]}
+    try:
+        data=_process_image(payload,_copernicus_access_token())
+    except RuntimeError as ex:
+        raise HTTPException(502,str(ex)[:300]) from ex
+    try:
+        path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+    except OSError:
+        pass
+    return Response(data,media_type='image/png',headers=hdr)
 
 @app.post('/api/areas/{area_id}/sync-satellite')
 def sync_satellite(area_id:int,v:Sync,req:Request):
