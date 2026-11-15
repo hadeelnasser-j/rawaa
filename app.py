@@ -555,7 +555,7 @@ def export_dataset(req:Request, include_demo:int=0):
 EVALSCRIPT = '''//VERSION=3
 // Monthly spectral features for each site (cloud/shadow/water masked by SCL: keep vegetation 4 and bare soil 5).
 function setup() {
-  return { input: [{bands:["B02","B03","B04","B05","B08","B8A","B11","SCL","dataMask"], units:"REFLECTANCE"}],
+  return { input: [{bands:["B02","B03","B04","B05","B08","B8A","B11","SCL","dataMask"]}],
     output: [ {id:"ndvi",bands:1,sampleType:"FLOAT32"}, {id:"ndmi",bands:1,sampleType:"FLOAT32"},
               {id:"ndwi",bands:1,sampleType:"FLOAT32"}, {id:"savi",bands:1,sampleType:"FLOAT32"},
               {id:"ndre",bands:1,sampleType:"FLOAT32"}, {id:"salinity",bands:1,sampleType:"FLOAT32"},
@@ -594,14 +594,14 @@ class Sync(BaseModel):
 
 # --- Optional live Sentinel-2 imagery for web map, never exposed as a public credential ---
 TRUE_COLOR_SCRIPT = """//VERSION=3
-function setup(){return {input:[{bands:['B04','B03','B02','SCL','dataMask'],units:'REFLECTANCE'}],output:{bands:4}}}
+function setup(){return {input:[{bands:['B04','B03','B02','SCL','dataMask']}],output:{bands:4}}}
 function evaluatePixel(s){
   if(s.dataMask===0 || [0,1,3,8,9,10,11].includes(s.SCL))return [0,0,0,0];
   return [Math.min(1,2.7*s.B04),Math.min(1,2.7*s.B03),Math.min(1,2.7*s.B02),1];
 }
 """
 NDVI_IMAGE_SCRIPT = """//VERSION=3
-function setup(){return {input:[{bands:['B04','B08','SCL','dataMask'],units:'REFLECTANCE'}],output:{bands:4}}}
+function setup(){return {input:[{bands:['B04','B08','SCL','dataMask']}],output:{bands:4}}}
 function evaluatePixel(s){
   if(s.dataMask===0 || ![4,5].includes(s.SCL))return [0,0,0,0];
   let v=(s.B08+s.B04)>0?(s.B08-s.B04)/(s.B08+s.B04):0;
@@ -614,7 +614,7 @@ function evaluatePixel(s){
 """
 _MASK = "if(s.dataMask===0 || [0,1,3,8,9,10,11].includes(s.SCL)) return [0,0,0,0];"
 def _layer_script(bands, body):
-    return ("//VERSION=3\nfunction setup(){return {input:[{bands:%s,units:'REFLECTANCE'}],output:{bands:4}}}\n"
+    return ("//VERSION=3\nfunction setup(){return {input:[{bands:%s}],output:{bands:4}}}\n"
             "function nd(a,b){return (a+b)!==0?(a-b)/(a+b):0}\n"
             "function evaluatePixel(s){%s %s}" % (json.dumps(bands+['SCL','dataMask']), _MASK, body))
 LAYER_SCRIPTS = {
