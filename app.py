@@ -205,6 +205,22 @@ def ensure_validation_sites():
 
 ensure_validation_sites()
 
+def purge_demo_areas():
+    """Remove the synthetic demo zones (A-E) with their readings, alerts and tasks; only real sites remain.
+    Set RAWAA_KEEP_DEMO=1 to keep them (used by the automated tests)."""
+    if os.getenv('RAWAA_KEEP_DEMO')=='1': return
+    with connect() as db:
+        ids=[r[0] for r in db.execute('SELECT id FROM areas WHERE demo=1')]
+        if not ids: return
+        q=','.join('?'*len(ids))
+        db.execute(f'DELETE FROM task_photos WHERE task_id IN (SELECT id FROM tasks WHERE area_id IN ({q}))',ids)
+        db.execute(f'DELETE FROM tasks WHERE area_id IN ({q})',ids)
+        db.execute(f'DELETE FROM alerts WHERE area_id IN ({q})',ids)
+        db.execute(f'DELETE FROM observations WHERE area_id IN ({q}) OR is_demo=1',ids)
+        db.execute(f'DELETE FROM areas WHERE id IN ({q})',ids)
+
+purge_demo_areas()
+
 EXTRA_INDEX_COLUMNS = ('ndwi','savi','ndre','salinity','ndvi_std')
 def migrate_spectral_columns():
     with connect() as db:
