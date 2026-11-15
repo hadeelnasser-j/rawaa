@@ -709,7 +709,7 @@ def sync_satellite(area_id:int,v:Sync,req:Request):
         stat_req={'input':{'bounds':bounds,'data':[{'type':'sentinel-2-l2a','dataFilter':{'maxCloudCoverage':80,'mosaickingOrder':'mostRecent'}}]},
                   'aggregation':{'timeRange':{'from':f'{start}T00:00:00Z','to':f'{end}T23:59:59Z'},
                                  'aggregationInterval':{'of':'P30D'},'lastIntervalBehavior':'SHORTEN','evalscript':EVALSCRIPT,
-                                 'resx':10,'resy':10}}
+                                 'resx':0.0001,'resy':0.0001}}
         results=api_json('https://sh.dataspace.copernicus.eu/statistics/v1',stat_req,
                           {'Content-Type':'application/json','Authorization':'Bearer '+tok},timeout=90)
     except RuntimeError as ex:
