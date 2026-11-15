@@ -201,3 +201,16 @@ html[lang=ar] body{font-family:'Tajawal',Arial,sans-serif}html[lang=en] body{fon
 .cop-head>:last-child{margin-inline-start:auto}
 .cop-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
 a.btn{text-decoration:none;display:inline-flex;align-items:center;gap:6px}
+
+/* Maintenance programme */
+.maint-panel{padding:22px;margin-top:17px}
+.maint-group{margin-top:14px}.maint-group b{font-size:13px}
+.maint-group ul{margin:6px 0 0;padding-inline-start:18px;font-size:12px;line-height:1.9}
+.eff{font-size:10px;font-weight:800;border-radius:6px;padding:2px 6px;margin-inline-start:4px}
+.eff.down{background:#ffebe9;color:#c0392b}.eff.up{background:#e3f6ea;color:#1b8f4b}
+.pest-warn{color:#c0392b;font-weight:700}
+.maint-verdict{margin-top:14px}.maint-alert{background:#ffefec!important;border-color:#f5c6bf!important;color:#a3352b!important}
+html[data-theme="dark"] .eff.down{background:#4a2421;color:#ff9b8f}html[data-theme="dark"] .eff.up{background:#173d2a;color:#7fe0a6}
+
+.layer-legend{font-size:12px;margin:6px 4px 0;line-height:1.8}.layer-legend code{font-size:11px;direction:ltr;unicode-bidi:embed}
+.key-value small{display:block;margin-top:4px}

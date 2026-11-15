@@ -176,7 +176,18 @@ function trendBlock(a){const valid=RawaaAnalysis.observations(a);if(!valid.lengt
    the exact area, Sentinel-2 L2A dataset, month and layer chosen in RAWAA. */
 const COP_BROWSER='https://browser.dataspace.copernicus.eu/';
 const COP_VIS='U2FsdGVkX1/zz8HXN+cLZmDvMHZlSkJyRf9w4FKQzbVp0wC7Q8paWnUd340AOhDCjiR439MrNVzvf18p7ySa7aD1eWD94hT7twTreLn/QDLvbtyNlU1W48Y+4hE6P2MH';
-const COP_LAYERS={ndvi:'3_NDVI',true_color:'1_TRUE_COLOR',false_color:'2_FALSE_COLOR',moisture:'5_MOISTURE_INDEX'};
+const COP_LAYERS={ndvi:'3_NDVI',true_color:'1_TRUE_COLOR',false_color:'2_FALSE_COLOR',urban:'4-FALSE-COLOR-URBAN',moisture:'5-MOISTURE-INDEX1',swir:'6-SWIR',ndwi:'7-NDWI',ndre:'3_NDVI'};
+/* Sentinel-2 layers rendered inside RAWAA through the server (Copernicus Process API). */
+const S2_LAYERS=[
+ ['true_color','ألوان حقيقية','True color','B4, B3, B2','',''],
+ ['false_color','ألوان كاذبة (نبات)','False color (vegetation)','B8, B4, B3','النبات السليم أحمر فاتح؛ الضعيف أغمق أو بني.','Healthy vegetation bright red; weak vegetation darker or brown.'],
+ ['ndvi','مؤشر NDVI','NDVI','(B8 − B4)/(B8 + B4)','أحمر < 0.08 · برتقالي 0.08–0.20 · أصفر 0.20–0.35 · أخضر 0.35–0.55 · أخضر داكن ≥ 0.55','Red < 0.08 · orange 0.08–0.20 · yellow 0.20–0.35 · green 0.35–0.55 · dark green ≥ 0.55'],
+ ['ndre','مؤشر الحافة الحمراء NDRE (الكلوروفيل)','NDRE (red edge / chlorophyll)','(B8A − B5)/(B8A + B5)','أحمر < 0.15 ضعيف · أصفر ~0.3 · أخضر ≥ 0.45 كلوروفيل جيد','Red < 0.15 low · yellow ~0.3 · green ≥ 0.45 good chlorophyll'],
+ ['moisture','مؤشر الرطوبة (NDMI)','Moisture index (NDMI)','(B8A − B11)/(B8A + B11)','أحمر/أصفر = جفاف وإجهاد مائي · سماوي/أزرق = رطوبة جيدة','Red/yellow = dry, water stress · cyan/blue = good moisture'],
+ ['ndwi','مؤشر الماء NDWI','NDWI (water)','(B3 − B8)/(B3 + B8)','أخضر = نبات · أبيض = تربة · أزرق = ماء أو تشبّع مائي','Green = vegetation · white = soil · blue = water or waterlogging'],
+ ['swir','SWIR','SWIR','B12, B8A, B4','النبات أخضر، التربة الرطبة داكنة، الجافة فاتحة.','Vegetation green, wet soil dark, dry soil bright.'],
+ ['urban','ألوان كاذبة (حضري)','False color (urban)','B12, B11, B4','يميّز الأسفلت والمباني عن الغطاء النباتي.','Separates asphalt and buildings from vegetation.']];
+const s2Layer=k=>S2_LAYERS.find(x=>x[0]===k);
 function areaCenter(a){try{const pts=a.geometry.coordinates.flat();const xs=pts.map(p=>+p[0]),ys=pts.map(p=>+p[1]);return [(Math.min(...ys)+Math.max(...ys))/2,(Math.min(...xs)+Math.max(...xs))/2]}catch(e){return [21.553,39.187]}}
 function copernicusBrowserUrl(a,layer='ndvi',month=S.mapMonth){
  const [lat,lng]=a?areaCenter(a):[21.553,39.187];const now=new Date();
@@ -188,13 +199,65 @@ function copLink(a,layer,label,cls='btn'){return `<a class="${cls}" href="${esc(
 function copernicusPanel(a){if(!a)return '';return `<div class="surface cop-panel"><div class="cop-head"><div class="stat-icon" style="margin:0;background:#eaf7ee;color:#1a8661">${icon('satellite',20)}</div><div><b>Copernicus Browser · Sentinel-2 L2A</b><p class="muted">${ar()?`${esc(areaLabel(a))} · فترة ${esc(S.mapMonth)} · غيوم ≤ 30%`:`${esc(areaLabel(a))} · period ${esc(S.mapMonth)} · clouds ≤ 30%`}</p></div><span class="status stable">${ar()?'مفعّل':'Active'}</span></div>
  <div class="cop-actions">${copLink(a,'ndvi',ar()?'NDVI للمنطقة':'Area NDVI','btn primary')}${copLink(a,'true_color',ar()?'ألوان حقيقية':'True color')}${copLink(a,'false_color',ar()?'ألوان كاذبة (نبات)':'False color (vegetation)')}${copLink(a,'moisture',ar()?'مؤشر الرطوبة':'Moisture index')}</div>
  <p class="help-note" style="margin-top:12px">${ar()?'تفتح المنصة الرسمية Copernicus Browser على حدود المنطقة نفسها وبالشهر المختار. للاطلاع على الصور لا تحتاج مفاتيح؛ قد يُطلب تسجيل دخول مجاني لبعض الأدوات مثل التنزيل والسلاسل الزمنية.':'Opens the official Copernicus Browser on this area for the chosen month. Viewing needs no keys; a free login may be required for tools like download and time series.'}</p></div>`}
+/* Approved agricultural maintenance programme (Appendix 6, "البرنامج المقترح لعمليات الصيانة الزراعية").
+   Months 1–12. effect: 'down' = expected short-term NDVI drop, 'up' = expected NDVI rise after a lag, '' = neutral.
+   Monthly routine tasks (weeding, mowing, edging, replacing dead plants) are listed once as monthly. */
+const MAINT={
+ palms:{ar:'النخيل',en:'Palms',items:[
+  ['إزالة ونقل فسائل النخيل','Offshoot removal',[2,9],'down'],['تكريب النخيل','Palm trunk cleaning (takreeb)',[11,12],''],
+  ['تقليم وإزالة السعف الجاف','Pruning dry fronds',[1,2,10,11],'down'],['إزالة الأشواك والعذوق القديمة','Thorn & old bunch removal',[1,2],''],
+  ['التلقيح','Pollination',[3,4],''],['خف العذوق','Bunch thinning',[5],''],['تقويس العذوق','Bunch bending',[6],''],['جني الثمار','Harvest',[8,9],''],
+  ['العزق / التقليب','Hoeing / tilling',[2,6,10],''],['سماد عضوي ١٥–٣٠ كغ/نخلة','Organic fertiliser 15–30 kg/palm',[1],'up'],
+  ['سماد كيميائي ٤٠٠–١٢٠٠ جم/نخلة','Chemical fertiliser 400–1200 g/palm',[3,5,9,11],'up']],
+  pests:{1:'f',3:'i',6:'i',7:'w',8:'w',9:'w',10:'i',12:'f'}},
+ trees:{ar:'الأشجار',en:'Trees',items:[
+  ['التقليم','Pruning',[1,2,11,12],'down'],['العزق / التقليب','Hoeing / tilling',[2,6,10],''],
+  ['تسميد عضوي ١٠–١٥ كغ/شجرة','Organic fertiliser 10–15 kg/tree',[1],'up'],['تسميد كيميائي ٣٠٠–٤٠٠ جم/شجرة','Chemical fertiliser 300–400 g/tree',[3,5,9,11],'up']],
+  pests:{1:'f',3:'i',5:'f',7:'i',9:'f',11:'i'}},
+ shrubs:{ar:'الشجيرات',en:'Shrubs',items:[
+  ['التقليم','Pruning',[1,2,11,12],'down'],['العزق / التقليب','Hoeing / tilling',[2,6,10],''],
+  ['تسميد عضوي ٣–٧ كغ/شجيرة','Organic fertiliser 3–7 kg/shrub',[1],'up'],['تسميد كيميائي ١٠٠–١٥٠ جم/شجيرة','Chemical fertiliser 100–150 g/shrub',[3,5,9,11],'up']],
+  pests:{1:'f',3:'i',5:'f',7:'i',9:'f',11:'i'}},
+ ground:{ar:'مغطيات التربة',en:'Ground covers',items:[
+  ['استبدال النباتات الحولية','Seasonal annuals replacement',[5,10],'down'],['العزق / التقليب','Hoeing / tilling',[2,6,10],''],
+  ['تسميد عضوي ٣ كغ/م²','Organic fertiliser 3 kg/m²',[1],'up'],['تسميد كيميائي ١٠٠–١٥٠ جم/م²','Chemical fertiliser 100–150 g/m²',[3,5,9,11],'up']],
+  pests:{1:'f',3:'i',5:'f',7:'i',9:'f',11:'i'}},
+ lawn:{ar:'النجيل (الثيل)',en:'Lawn',items:[
+  ['التهوية','Aeration',[3,10],'down'],['إزالة طبقة الألياف المتراكمة (De-Thatching)','De-thatching',[3],'down'],
+  ['ترميم وتجديد النجيل (Top dressing)','Top dressing',[3,10],'down'],
+  ['تسميد عضوي ١٫٥–٣ كغ/م²','Organic fertiliser 1.5–3 kg/m²',[1],'up'],['تسميد كيميائي ١٠–٢٠ جم/م²','Chemical fertiliser 10–20 g/m²',[3,5,9,11],'up']],
+  pests:{1:'f',3:'i',5:'f',7:'i',9:'f',11:'i'}}
+};
+const PEST={i:['مبيد حشري','Insecticide'],f:['مبيد فطري','Fungicide'],w:['حظر/تحذير استخدام المبيدات (الصيف)','Pesticide restriction (summer)']};
+const MONTHS_AR=['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
+const MONTHS_EN=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function maintGroups(a){const t=(a?.plants||'').toLowerCase();const k=[];if(/grass|lawn|نجيل|ثيل/.test(t))k.push('lawn');if(/palm|نخل/.test(t))k.push('palms');if(/tree|شجر|أشجار/.test(t))k.push('trees');if(/shrub|شجير/.test(t))k.push('shrubs');if(/ground|مغطي/.test(t))k.push('ground');return (k.length?k:Object.keys(MAINT)).map(x=>MAINT[x])}
+function maintenanceFor(m,a){const out=[];for(const g of maintGroups(a)){const items=g.items.filter(x=>x[2].includes(m));const pest=g.pests[m];if(items.length||pest)out.push({g,items,pest})}return out}
+function maintenanceDrops(m,a){return maintGroups(a).flatMap(g=>g.items.filter(x=>x[3]==='down'&&x[2].includes(m)).map(x=>`${ar()?x[0]:x[1]} (${ar()?g.ar:g.en})`))}
+function maintenancePanel(a){
+ const m=a?.metrics,latestMonth=m?.latest_date?Number(m.latest_date.slice(5,7)):null;
+ const month=Number((S.mapMonth||'').slice(5,7))||new Date().getMonth()+1;const mname=ar()?MONTHS_AR[month-1]:MONTHS_EN[month-1];
+ const rows=maintenanceFor(month,a).map(({g,items,pest})=>`<div class="maint-group"><b>${ar()?g.ar:g.en}</b><ul>${items.map(x=>`<li>${esc(ar()?x[0]:x[1])} ${x[3]==='down'?`<span class="eff down">${ar()?'قد يخفض NDVI مؤقتًا':'may lower NDVI briefly'}</span>`:x[3]==='up'?`<span class="eff up">${ar()?'يرفع NDVI لاحقًا':'raises NDVI later'}</span>`:''}</li>`).join('')}${pest?`<li class="${pest==='w'?'pest-warn':''}">${esc(PEST[pest][ar()?0:1])}</li>`:''}</ul></div>`).join('');
+ let verdict='';
+ if(latestMonth&&m.change_pct!==null&&m.change_pct!==undefined&&m.change_pct<=-10){
+  const prev=latestMonth===1?12:latestMonth-1;const causes=[...new Set([...maintenanceDrops(latestMonth,a),...maintenanceDrops(prev,a)])];
+  verdict=causes.length?`<div class="help-note warning maint-verdict">${ar()?`انخفاض NDVI الأخير (${m.change_pct}%) يتزامن مع صيانة مجدولة قد تخفض المؤشر مؤقتًا: <b>${esc(causes.join('، '))}</b>. تحقّقوا من تنفيذها قبل اعتباره إجهادًا.`:`The latest NDVI decline (${m.change_pct}%) coincides with scheduled maintenance that can lower NDVI briefly: <b>${esc(causes.join(', '))}</b>. Confirm it was carried out before treating it as stress.`}</div>`
+   :`<div class="help-note maint-verdict maint-alert">${ar()?`انخفاض NDVI الأخير (${m.change_pct}%) <b>لا يفسّره</b> البرنامج المعتمد للصيانة في هذا الشهر أو الذي قبله، فهو مؤشر إجهاد محتمل يستحق التحقق الميداني.`:`The latest NDVI decline (${m.change_pct}%) is <b>not explained</b> by the approved maintenance programme for this or the previous month, so it is a likely stress signal worth field verification.`}</div>`}
+ return `<div class="surface maint-panel"><div class="cop-head"><div class="stat-icon" style="margin:0;background:#eaf7ee;color:#1a8661">${icon('calendar',20)}</div><div><b>${ar()?'برنامج الصيانة الزراعية المعتمد':'Approved maintenance programme'}</b><p class="muted">${ar()?`أعمال شهر ${mname} حسب الملحق ٦ · غيّري الشهر من «فترة Sentinel-2» في الخريطة`:`${mname} activities per Appendix 6 · change the month from the map's Sentinel-2 period`}</p></div></div>
+ ${verdict}${rows||`<p class="muted">${ar()?'لا توجد أعمال مجدولة':'No scheduled work'}</p>`}
+ <p class="muted" style="font-size:11px;margin:12px 0 0">${ar()?'الأعمال الشهرية الثابتة (التعشيب، القص، التحديد، استبدال النباتات الميتة) غير مدرجة.':'Monthly routine work (weeding, mowing, edging, replacing dead plants) is not listed.'}</p></div>`}
+function spectralBlock(a){const o=(a?.metrics?.observations||[]).filter(x=>!x.is_demo).at(-1);if(!o||o.ndwi==null&&o.savi==null&&o.ndre==null)return '';
+ const kv=(k,v,h)=>`<div class="key-value"><span>${k}</span><b>${fmt(v)}</b>${h?`<small class="muted" style="font-size:10px">${h}</small>`:''}</div>`;
+ return `<div style="margin-top:16px"><h3 style="font-size:15px;margin:0 0 4px">${ar()?'المؤشرات الطيفية لآخر فترة':'Latest spectral indices'}</h3><p class="muted" style="font-size:11px;margin:0">${dt(o.measured_at)} · Sentinel-2 L2A</p><div class="key-values" style="margin:12px 0">${kv('NDMI',o.ndmi,ar()?'رطوبة النبات':'plant moisture')}${kv('NDRE',o.ndre,ar()?'الكلوروفيل':'chlorophyll')}${kv('SAVI',o.savi,ar()?'يقلل أثر التربة':'soil-adjusted')}${kv('NDWI',o.ndwi,ar()?'الماء/التشبع':'water')}${kv('SI',o.salinity,ar()?'مؤشر ملوحة √(B2·B4)':'salinity √(B2·B4)')}${kv(ar()?'تباين NDVI':'NDVI std',o.ndvi_std,ar()?'عدم تجانس داخل الحديقة':'within-park patchiness')}</div></div>`}
+function validationNote(a){if(!a?.role_ar)return '';const [lat,lng]=areaCenter(a);const osm=(a.boundary_source||'').startsWith('OSM');const isVal=a.category==='Validation site';
+ return `<div class="help-note ${isVal?'warning':''}" style="margin-top:12px"><b>${isVal?(ar()?'موقع تحقق ميداني':'Field validation site'):(ar()?'دراسة حالة':'Case study')}</b> · ${esc(ar()?a.role_ar:a.role_en)}<br>${ar()?'الإحداثيات':'Coordinates'} ${lat.toFixed(5)}, ${lng.toFixed(5)} · ${osm?(ar()?'الحدود من OpenStreetMap':'Boundary from OpenStreetMap')+' ('+esc(a.boundary_source)+') © OpenStreetMap contributors':(ar()?'حدود تقريبية (نحو ٢٠٠×١٥٠ م حول الموقع) إلى أن تُرسم الحدود الفعلية':'Approximate boundary (~200×150 m) until the real outline is drawn')}${a.metrics.observations.length?'':`<br>${ar()?'لا توجد قراءات تجريبية؛ اضغطوا «جلب قراءات فضائية» لعرض قراءات Sentinel-2 الحقيقية.':'No demo readings; click Sync to load real Sentinel-2 readings.'}`}</div>`}
 function mapControls(){const areas=S.data?.areas||[];return `<div class="layer-toolbar">
  <div class="layer-buttons" role="group" aria-label="${t('mapLayers')}">
- ${[['street','streetLayer','map'],['satellite','satelliteLayer','satellite-dish'],['ndvi','ndviLayer','sprout']].map(([key,label,ic])=>`<button class="layer-choice ${S.mapLayer===key?'selected':''}" data-action="map-layer" data-layer="${key}" aria-pressed="${S.mapLayer===key}">${icon(ic,15)} ${t(label)}</button>`).join('')}
- </div><label class="layer-field">${ar()?'فترة Sentinel-2':'Sentinel-2 period'} <input id="map-month" type="month" min="2018-01" max="${new Date().toISOString().slice(0,7)}" value="${S.mapMonth}"/></label>
+ ${[['street','streetLayer','map'],['satellite','satelliteLayer','satellite-dish']].map(([key,label,ic])=>`<button class="layer-choice ${S.mapLayer===key?'selected':''}" data-action="map-layer" data-layer="${key}" aria-pressed="${S.mapLayer===key}">${icon(ic,15)} ${t(label)}</button>`).join('')}
+ </div><label class="layer-field">${ar()?'طبقة Sentinel-2':'Sentinel-2 layer'} <select id="map-s2-layer"><option value="">${ar()?'— بدون —':'— none —'}</option>${S2_LAYERS.map(x=>`<option value="${x[0]}" ${S.mapLayer===x[0]?'selected':''}>${esc(ar()?x[1]:x[2])}</option>`).join('')}</select></label><label class="layer-field">${ar()?'فترة Sentinel-2':'Sentinel-2 period'} <input id="map-month" type="month" min="2018-01" max="${new Date().toISOString().slice(0,7)}" value="${S.mapMonth}"/></label>
  <label class="layer-field">${t('mapArea')} <select id="map-area">${areas.map(a=>`<option value="${a.id}" ${S.areaId===a.id?'selected':''}>${esc(areaLabel(a))}</option>`).join('')}</select></label>
- ${copLink(selectedArea(),S.mapLayer==='street'?'ndvi':S.mapLayer==='satellite'?'true_color':'ndvi',ar()?'فتح في Copernicus Browser':'Open in Copernicus Browser','btn primary')}
- </div><p class="layer-source" id="map-layer-source">${S.mapLayer==='street'?'OpenFreeMap · OpenMapTiles · OpenStreetMap':S.mapLayer==='satellite'?t('basemapSource'):(S.data?.integration?t('copernicusLoading'):(ar()?'طبقة NDVI الفعلية متاحة الآن عبر زر «فتح في Copernicus Browser» للمنطقة والشهر المختارين.':'Real NDVI is available now via “Open in Copernicus Browser” for the selected area and month.'))}</p>`}
+ ${copLink(selectedArea(),s2Layer(S.mapLayer)?S.mapLayer:S.mapLayer==='satellite'?'true_color':'ndvi',ar()?'فتح في Copernicus Browser':'Open in Copernicus Browser','btn primary')}
+ </div><p class="layer-source" id="map-layer-source">${S.mapLayer==='street'?'OpenFreeMap · OpenMapTiles · OpenStreetMap':S.mapLayer==='satellite'?t('basemapSource'):(S.data?.integration?t('copernicusLoading'):(ar()?'لعرض الطبقة داخل رواء يلزم ربط مفاتيح Copernicus في الخادم؛ وهي متاحة الآن عبر زر «فتح في Copernicus Browser».':'Showing this layer inside RAWAA needs Copernicus keys on the server; it is available now via “Open in Copernicus Browser”.'))}</p>${s2Layer(S.mapLayer)?`<p class="layer-legend"><b>${esc(ar()?s2Layer(S.mapLayer)[1]:s2Layer(S.mapLayer)[2])}</b> · <code>${esc(s2Layer(S.mapLayer)[3])}</code>${s2Layer(S.mapLayer)[4]?' · '+esc(ar()?s2Layer(S.mapLayer)[4]:s2Layer(S.mapLayer)[5]):''}</p>`:''}`}
 function mapPage(){return `${heading(t('map'),t('mapDesc'),S.user.role==='regulator'?btn(t('newArea'),'new-area',{primary:true,icon:'plus'}):'')}
  <section class="surface map-screen">${mapControls()}<div id="full-map" class="map-box large"></div><div class="map-foot-note">${icon('info',14)} ${t('demoBoundaries')} · ${t('cloudNote')}</div></section>
  <div class="section-row"><h3>${t('areas')}</h3></div>${areaRows()}`}
@@ -206,7 +269,7 @@ function areaPage(){const a=selectedArea();if(!a)return empty();const m=a.metric
  return `${heading(esc(areaLabel(a)),t('areaDesc'),`${btn(t('areas'),'back-areas',{icon:'arrow-left'})}${S.user.role==='regulator'?btn(t('importCsv'),'import',{icon:'file-up'})+btn(t('sync'),'sync',{primary:true,icon:'satellite-dish'}):''}`)}
  <div class="area-layout"><div class="surface area-details"><div style="display:flex;justify-content:space-between;align-items:center"><div><h3>${t('areaDetails')}</h3><p class="muted" style="margin:0;font-size:12px">${t('lastRead')}: ${dt(m.latest_date)}</p></div>${badge(m.status)}</div>
  <div class="key-values"><div class="key-value"><span>${t('latest')}</span><b>${fmt(m.current_ndvi)}</b></div><div class="key-value"><span>${t('baseline')}</span><b>${fmt(m.baseline)}</b></div><div class="key-value"><span>${t('change')}</span><b>${m.change_pct===null?'—':m.change_pct+'%'}</b></div><div class="key-value"><span>${t('dataQuality')}</span><b>${m.observations.length?m.observations.at(-1).valid_pixels_pct+'%':'—'}</b></div></div>
- <div class="provenance">${icon('database',15)} ${esc(m.source||t('empty'))} ${origin(a)}</div>
+ <div class="provenance">${icon('database',15)} ${esc(m.source||t('empty'))} ${origin(a)}</div>${validationNote(a)}${spectralBlock(a)}
  <div style="margin-top:22px"><h3 style="font-size:15px;margin:0 0 12px">${t('trendTitle')}</h3>${trendBlock(a)}</div>
  ${m.forecast&&m.forecast_kind==='illustrative_linear_trend'?`<div class="insight-box"><div class="label">${t('future')} · ${t('forecastDisclaimer')}</div><div class="forecast"><div><span>${t('m1')}</span><b>${fmt(m.forecast[0])}</b></div><div><span>${t('m2')}</span><b>${fmt(m.forecast[1])}</b></div></div></div>`:`<div class="help-note" style="margin-top:15px">${t('noForecast')}</div>`}
  <div class="help-note warning" style="margin-top:12px">${t('analysisNote')}</div></div>
@@ -214,7 +277,7 @@ function areaPage(){const a=selectedArea();if(!a)return empty();const m=a.metric
   <div class="surface" style="padding:24px;margin-top:17px"><h3 style="font-size:16px;margin:0 0 18px">${t('areaDetails')}</h3>
    <div class="kpi-line"><span>${t('plantType')}</span><b>${esc(a.plants||'—')}</b></div><div class="kpi-line"><span>${t('irrigation')}</span><b>${esc(a.irrigation||'—')}</b></div><div class="kpi-line"><span>${t('plantingDate')}</span><b>${esc(a.planting_date||'—')}</b></div><div class="kpi-line"><span>${t('sensorStatus')}</span><b>${m.demo?'DEMO':'USER / SATELLITE'}</b></div>
    ${S.user.role==='regulator'&&['monitor','high'].includes(m.status)?`<div style="margin-top:18px">${btn(t('scan'),'scan',{primary:true,icon:'bell-plus'})}</div>`:''}
-  </div>${copernicusPanel(a)}</div></div>`}
+  </div>${copernicusPanel(a)}${maintenancePanel(a)}</div></div>`}
 function alertsPage(){return `${heading(t('alertsHead'),t('alertsSub'))}
  <div class="stats-grid">${stat(t('alertsOpen'),S.data.counts.alerts,'amber','bell')}${stat(t('critical'),S.data.alerts.filter(x=>x.severity==='high'&&x.status!=='closed').length,'red','triangle-alert')}${stat(t('attention'),S.data.alerts.filter(x=>x.severity==='monitor'&&x.status!=='closed').length,'green','eye')}${stat(t('closed'),S.data.alerts.filter(x=>x.status==='closed').length,'blue','check-check')}</div>
  <section class="surface table-wrap"><table class="data-table"><thead><tr><th>#</th><th>${t('site')}</th><th>${t('risk')}</th><th>${t('reason')}</th><th>${t('status')}</th><th>${t('created')}</th><th>${t('actions')}</th></tr></thead><tbody>
@@ -234,7 +297,7 @@ function tasksPage(){return `${heading(t('tasksHead'),t('tasksSub'),btn(t('expor
  <div class="stats-grid">${stat(t('open'),S.data.tasks.filter(x=>x.status==='open').length,'blue','list-todo')}${stat(t('in_progress'),S.data.tasks.filter(x=>x.status==='in_progress').length,'amber','wrench')}${stat(t('pending_review'),S.data.tasks.filter(x=>x.status==='pending_review').length,'red','clock')}${stat(t('closed'),S.data.tasks.filter(x=>x.status==='closed').length,'green','check-circle')}</div>
  <section class="surface table-wrap"><table class="data-table"><thead><tr><th>#</th><th>${t('task')}</th><th>${t('site')}</th><th>${t('priority')}</th><th>${t('status')}</th><th>${t('deadline')}</th><th>${t('actions')}</th></tr></thead><tbody>
  ${S.data.tasks.map(task=>`<tr><td>#${task.id}</td><td class="strong-name">${esc(taskLabel(task))}</td><td>${esc(areaLabel(getArea(task.area_id)||{name_ar:'—',name_en:'—'}))}</td><td>${task.priority==='high'?badge('high'):esc(task.priority)}</td><td>${badge(task.status)}</td><td>${dt(task.due_at)}</td><td>${taskAction(task)}${photoButtons(task)}</td></tr>`).join('')||`<tr><td colspan="7">${t('empty')}</td></tr>`}</tbody></table></section>`}
-function reportsPage(){return `${heading(t('reportTitle'),t('reportDesc'),btn(t('export'),'export',{primary:true,icon:'download'}))}
+function reportsPage(){return `${heading(t('reportTitle'),t('reportDesc'),btn(t('export'),'export',{primary:true,icon:'download'})+(S.user.role==='regulator'?btn(ar()?'تصدير بيانات التدريب (CSV)':'Export training dataset (CSV)','export-dataset',{icon:'download'}):''))}
  <div class="stats-grid">${stat(t('allAreas'),S.data.counts.total,'green','trees')}${stat(t('openTasks'),S.data.counts.tasks_open,'blue','clipboard-list')}${stat(t('closedTasks'),S.data.tasks.filter(x=>x.status==='closed').length,'amber','check-check')}${stat(t('accuracy'),t('notValidated'),'red','activity')}</div>
  <div class="dashboard-grid"><section class="surface compact-kpi"><h3>${t('operationTitle')}</h3><div class="kpi-line"><span>${t('alertsOpen')}</span><b>${S.data.counts.alerts}</b></div><div class="kpi-line"><span>${t('openTasks')}</span><b>${S.data.counts.tasks_open}</b></div><div class="kpi-line"><span>${t('closedTasks')}</span><b>${S.data.tasks.filter(x=>x.status==='closed').length}</b></div><div class="help-note" style="margin-top:14px">${t('sourceNote')}</div></section>
  <section class="surface compact-kpi"><h3>${t('accuracy')}</h3><div style="font-size:30px;font-weight:800;color:#b5c0b9;margin:20px 0">—</div><div class="help-note warning">${t('validationInfo')}</div></section></div>
@@ -280,6 +343,7 @@ async function handleClick(e){let el=e.target.closest('[data-action],[data-view]
  case 'task-approve':await perform(async()=>{await api(`/tasks/${id}`,{method:'PATCH',body:{status:'closed'}});toast(t('closed'))});return;
  case 'task-reopen':await perform(async()=>{await api(`/tasks/${id}`,{method:'PATCH',body:{status:'reopened'}});toast(t('reopened'))});return;
  case 'export':window.location.href='/api/reports/tasks.csv';return;
+ case 'export-dataset':window.location.href='/api/reports/dataset.csv';return;
  }
 }
 async function handleSubmit(e){if(!e.target.matches('#login-form,#area-form,#import-form,#complete-form,#photo-form'))return;e.preventDefault();let f=new FormData(e.target);
@@ -292,7 +356,7 @@ async function handleSubmit(e){if(!e.target.matches('#login-form,#area-form,#imp
 async function fetchActivity(){try{let rows=await api('/activity');let el=$('#activity-list');if(!el)return;el.innerHTML=rows.length?rows.slice(0,20).map(x=>`<div class="list-row"><span class="list-mark">${icon('history',16)}</span><div class="list-main"><b>${esc(x.verb)}</b><small>${esc(x.details)}</small></div><span class="muted" style="font-size:11px">${dt(x.created_at)}</span></div>`).join(''):empty();createIcons()}catch(e){toast(e.message,true)}}
 document.addEventListener('click',e=>{if(e.target?.id==='modal-shade'){S.modal=null;render();return}handleClick(e)});
 document.addEventListener('submit',handleSubmit);
-document.addEventListener('change',async e=>{if(e.target.id==='analysis-area'){S.areaId=Number(e.target.value);S.compareFrom=null;S.compareTo=null;render();document.getElementById('analysis-area')?.focus();return}if(['compare-from','compare-to'].includes(e.target.id)){S[e.target.id==='compare-from'?'compareFrom':'compareTo']=e.target.value;const focus=e.target.id;render();document.getElementById(focus)?.focus();return}if(e.target.id==='dash-area-select'||e.target.id==='map-area'){S.areaId=Number(e.target.value);S.mapFocus=true;render();return}if(e.target.id==='map-month'){S.mapMonth=e.target.value;render();return}if(['role-switch','role-top-switch'].includes(e.target.id)){const next=e.target.value;if(next===S.user.role)return;try{const r=await api('/demo/switch-role',{method:'POST',body:{role:next}});S.user=r.user;S.view='dashboard';S.areaId=null;S.modal=null;await load();toast(t('roleChanged'))}catch(err){toast(err.message,true);render()}return}});
+document.addEventListener('change',async e=>{if(e.target.id==='analysis-area'){S.areaId=Number(e.target.value);S.compareFrom=null;S.compareTo=null;render();document.getElementById('analysis-area')?.focus();return}if(['compare-from','compare-to'].includes(e.target.id)){S[e.target.id==='compare-from'?'compareFrom':'compareTo']=e.target.value;const focus=e.target.id;render();document.getElementById(focus)?.focus();return}if(e.target.id==='dash-area-select'||e.target.id==='map-area'){S.areaId=Number(e.target.value);S.mapFocus=true;render();return}if(e.target.id==='map-month'){S.mapMonth=e.target.value;render();return}if(e.target.id==='map-s2-layer'){S.mapLayer=e.target.value||'satellite';render();return}if(['role-switch','role-top-switch'].includes(e.target.id)){const next=e.target.value;if(next===S.user.role)return;try{const r=await api('/demo/switch-role',{method:'POST',body:{role:next}});S.user=r.user;S.view='dashboard';S.areaId=null;S.modal=null;await load();toast(t('roleChanged'))}catch(err){toast(err.message,true);render()}return}});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&S.modal){S.modal=null;render()}else if(e.key==='Enter'&&e.target.matches('[role=button][data-action]'))handleClick({target:e.target})});
 
 Object.assign(L.ar,{'analysis-detail':'تفاصيل التحليل',connected:'مهيأ · لم يُتحقق من الاتصال',area:'تفاصيل المنطقة',intelligence:'التحليل الذكي',intelTitle:'التحليل الذكي للغطاء النباتي',intelSub:'رؤية تحليلية متكاملة تساعد على فهم حالة المساحات الخضراء، ورصد التغيّرات مبكرًا، وتحديد أولويات المتابعة والصيانة.'});
