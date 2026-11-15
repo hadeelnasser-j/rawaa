@@ -153,6 +153,27 @@ def init_db():
 
 init_db()
 
+# Field-validation sites supplied by the team (Google Maps pins). Boundaries are an approximate
+# ~200 x 150 m rectangle around each pin until the real park outline is drawn. No synthetic readings
+# are attached: these sites only show what Copernicus Sentinel-2 actually returns.
+VALIDATION_SITES = [
+    ('موقع التحقق ١','Validation site 1',21.5492043,39.2089827),
+    ('موقع التحقق ٢','Validation site 2',21.6531027,39.1083515),
+    ('حديقة الأجواد الجديدة','Al Ajwad New Park',21.5950333,39.2533068),
+]
+
+def ensure_validation_sites():
+    with connect() as db:
+        for ar,en,lat,lng in VALIDATION_SITES:
+            if db.execute('SELECT 1 FROM areas WHERE name_en=?',(en,)).fetchone():
+                continue
+            db.execute('INSERT INTO areas(name_ar,name_en,category,assigned_operator,geometry,irrigation,plants,planting_date,demo,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                (ar,en,'Validation site',2,json.dumps(square(lng,lat,0.001)),'','',None,0,utcnow()))
+            db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES (?,?,?,?,?)',
+                (1,'seed','area',f'Validation site added: {en} ({lat:.5f}, {lng:.5f}) - approximate boundary',utcnow()))
+
+ensure_validation_sites()
+
 
 def current_user(req: Request):
     cookie=req.cookies.get('rawaa_session','')
