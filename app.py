@@ -14,6 +14,7 @@ import json
 import re
 from maintenance_engine import maintenance_engine, MONTHLY_MAINTENANCE, ndvi_drop_activities
 from plant_catalog import PLANTS, parse_species, species_summary, salt_tolerant
+import rawaa_ml
 import math
 import os
 import secrets
@@ -301,13 +302,26 @@ def purge_demo_areas():
         db.execute(f'DELETE FROM tasks WHERE area_id IN ({q})',ids)
         db.execute(f'DELETE FROM alerts WHERE area_id IN ({q})',ids)
         db.execute(f'DELETE FROM observations WHERE area_id IN ({q}) OR is_demo=1',ids)
+        for tb in ('thermal','labels'):
+            db.execute(f'DELETE FROM {tb} WHERE area_id IN ({q})',ids)
         db.execute(f'DELETE FROM areas WHERE id IN ({q})',ids)
 
-purge_demo_areas()
 
 EXTRA_INDEX_COLUMNS = ('ndwi','savi','ndre','salinity','ndvi_std')
 def migrate_spectral_columns():
     with connect() as db:
+        db.executescript('''
+            CREATE TABLE IF NOT EXISTS thermal(
+              id INTEGER PRIMARY KEY, area_id INTEGER NOT NULL, measured_at TEXT NOT NULL,
+              lst_park REAL, lst_ring REAL, valid_pixels_pct REAL, created_at TEXT NOT NULL,
+              UNIQUE(area_id, measured_at), FOREIGN KEY(area_id) REFERENCES areas(id));
+            CREATE TABLE IF NOT EXISTS labels(
+              id INTEGER PRIMARY KEY, area_id INTEGER NOT NULL, observed_on TEXT NOT NULL, cause TEXT NOT NULL,
+              source TEXT NOT NULL, notes TEXT DEFAULT '', task_id INTEGER, created_at TEXT NOT NULL,
+              FOREIGN KEY(area_id) REFERENCES areas(id));
+        ''')
+        if 'confirmed_cause' not in table_columns(db,'tasks'):
+            db.execute("ALTER TABLE tasks ADD COLUMN confirmed_cause TEXT DEFAULT ''")
         have=table_columns(db,'observations')
         for col in EXTRA_INDEX_COLUMNS:
             if col not in have: db.execute(f'ALTER TABLE observations ADD COLUMN {col} REAL')
@@ -315,6 +329,7 @@ def migrate_spectral_columns():
             db.execute('ALTER TABLE task_photos ADD COLUMN data '+('BYTEA' if IS_PG else 'BLOB'))
 
 migrate_spectral_columns()
+purge_demo_areas()
 
 
 def current_user(req: Request):
@@ -344,8 +359,19 @@ def in_scope_clause(user, alias='a'):
     return ('',[])
 
 
+def same_season(rows,latest):
+    """Readings from the same time of year (±1 month) in earlier years; used once 24+ months exist,
+    so a normal summer dip is not mistaken for decline."""
+    if len(rows)<24: return []
+    lm=int(latest['measured_at'][5:7]);ld=date.fromisoformat(latest['measured_at'])
+    out=[r for r in rows if (ld-date.fromisoformat(r['measured_at'])).days>300 and min((int(r['measured_at'][5:7])-lm)%12,(lm-int(r['measured_at'][5:7]))%12)<=1]
+    return out if len(out)>=2 else []
+
 def metrics(area_id, db):
     rows=[dict(r) for r in db.execute('SELECT measured_at,ndvi,ndmi,ndwi,savi,ndre,salinity,ndvi_std,valid_pixels_pct,source,is_demo FROM observations WHERE area_id=? ORDER BY measured_at', (area_id,))]
+    return metrics_from_rows(rows)
+
+def metrics_from_rows(rows):
     real=[r for r in rows if not r['is_demo'] and r['ndvi'] is not None]
     series=real if real else [r for r in rows if r['is_demo']]
     quality=[r for r in series if r['valid_pixels_pct'] >= 60]
@@ -355,8 +381,9 @@ def metrics(area_id, db):
                 'change_pct':None,'forecast':None,'forecast_kind':None,
                 'latest_date':quality[-1]['measured_at'] if quality else None,'demo':bool(series and series[0]['is_demo']),
                 'source':series[-1]['source'] if series else None,'observations':series}
-    base=statistics.median([r['ndvi'] for r in quality[:-2]])
     latest=quality[-1]
+    season=same_season(quality,latest)
+    base=statistics.median([r['ndvi'] for r in season]) if season else statistics.median([r['ndvi'] for r in quality[:-2]])
     change_pct=(latest['ndvi']-base)/abs(base)*100 if base else None
     last2=[(r['ndvi']-base)/abs(base)*100 for r in quality[-2:]] if base else [0,0]
     if all(x<=-20 for x in last2): status='high'
@@ -367,7 +394,7 @@ def metrics(area_id, db):
     monthly_delta=(xs[-1]-xs[0])/2
     forecast=[round(max(-1,min(1,latest['ndvi']+monthly_delta*i)),3) for i in (1,2)]
     return {'status':status,'baseline':round(base,3),'current_ndvi':latest['ndvi'],
-            'change_pct':round(change_pct,1) if change_pct is not None else None,
+            'change_pct':round(change_pct,1) if change_pct is not None else None,'baseline_kind':'seasonal' if season else 'rolling',
             'forecast':forecast,'forecast_kind':'illustrative_linear_trend',
             'latest_date':latest['measured_at'],'demo':bool(series[0]['is_demo']),
             'source':latest['source'],'observations':series}
@@ -402,52 +429,76 @@ def _holt(y,alpha=0.5,beta=0.3,phi=0.85):
         trend=beta*(new_level-level)+(1-beta)*phi*trend;level=new_level
     return preds,level,trend
 
+def _hw(y,alpha=0.4,beta=0.1,gamma=0.3,m=12):
+    """Additive Holt-Winters (level + trend + 12-month season). Returns one-step predictions and a forecaster."""
+    season=[y[i]-statistics.mean(y[:m]) for i in range(m)]
+    level=statistics.mean(y[:m]);trend=(statistics.mean(y[m:2*m])-statistics.mean(y[:m]))/m if len(y)>=2*m else 0.0
+    preds=[None]*len(y)
+    for t in range(len(y)):
+        if t>=m: preds[t]=level+trend+season[t%m]
+        new_level=alpha*(y[t]-season[t%m])+(1-alpha)*(level+trend)
+        trend=beta*(new_level-level)+(1-beta)*trend
+        season[t%m]=gamma*(y[t]-new_level)+(1-gamma)*season[t%m];level=new_level
+    n=len(y)
+    return preds,(lambda h:level+h*trend+season[(n+h-1)%m])
+
+def _candidates(y):
+    """One-step predictions + h-step forecaster for each model that has enough history."""
+    out={}
+    out['naive']=([None]+y[:-1],lambda h,yy=y:yy[-1],'«نفس قيمة الشهر السابق»','Same as last month')
+    if len(y)>=5:
+        p,level,trend=_holt(y,phi=0.85)
+        out['holt']=(p,(lambda h,l=level,tr=trend:l+sum(0.85**i for i in range(1,h+1))*tr),'Holt بالاتجاه المخمّد','Holt damped trend')
+    if len(y)>=15:
+        out['seasonal_naive']=([None]*12+y[:-12],(lambda h,yy=y:yy[len(yy)-12+(h-1)%12]),'«نفس الشهر من العام الماضي»','Same month last year')
+    if len(y)>=24:
+        p,f=_hw(y);out['holt_winters']=(p,f,'Holt-Winters الموسمي (اتجاه + موسم سنوي)','Seasonal Holt-Winters')
+    return out
+
 def _forecast(series,base):
     y=[r['ndvi'] for r in series]
     if len(y)<5: return {'available':False,'reason_ar':'يلزم 5 قراءات شهرية صالحة على الأقل للتنبؤ.','reason_en':'At least 5 valid monthly readings are needed to forecast.'}
-    preds,level,trend=_holt(y,phi=0.85)
-    errs=[y[t]-preds[t] for t in range(2,len(y))]
-    sd=max(statistics.pstdev(errs) if len(errs)>1 else 0.03,0.01)
-    # honest back-test: model vs "same as last month" on the last 3 months
-    bt=range(max(2,len(y)-3),len(y))
-    mae_model=statistics.mean(abs(y[t]-preds[t]) for t in bt)
-    mae_naive=statistics.mean(abs(y[t]-y[t-1]) for t in bt)
-    last=date.fromisoformat(series[-1]['measured_at'])
-    out=[];phi=0.85
+    cands=_candidates(y)
+    k=min(6,max(2,len(y)//4));test=range(len(y)-k,len(y))
+    scores={}
+    for name,(p,_f,_a,_e) in cands.items():
+        errs=[abs(y[t]-p[t]) for t in test if p[t] is not None]
+        if len(errs)==len(test): scores[name]=statistics.mean(errs)
+    best=min(scores,key=scores.get);p,f,label_ar,label_en=cands[best]
+    resid=[y[t]-p[t] for t in range(len(y)) if p[t] is not None][-12:]
+    sd=max(statistics.pstdev(resid) if len(resid)>1 else 0.03,0.01)
+    last=date.fromisoformat(series[-1]['measured_at']);out=[]
     for h in (1,2,3):
-        damp=sum(phi**i for i in range(1,h+1))
-        v=max(-1,min(1,level+damp*trend));w=1.96*sd*math.sqrt(h)
-        d=last+timedelta(days=30*h)
+        v=max(-1,min(1,f(h)));w=1.96*sd*math.sqrt(h);d=last+timedelta(days=30*h)
         out.append({'h':h,'date':d.isoformat(),'month_ar':_MONTHS_AR[d.month-1],'ndvi':round(v,3),'low':round(v-w,3),'high':round(v+w,3)})
-    threshold=base*0.85 if base and base>0 else None
-    risk=None
+    threshold=base*0.85 if base and base>0 else None;risk=None
     if threshold is not None:
-        zz=(threshold-out[-1]['ndvi'])/(sd*math.sqrt(3))
-        risk=round(100*0.5*(1+math.erf(zz/math.sqrt(2))))
-    slope=trend
+        zz=(threshold-out[-1]['ndvi'])/(sd*math.sqrt(3));risk=round(100*0.5*(1+math.erf(zz/math.sqrt(2))))
+    slope=(out[-1]['ndvi']-y[-1])/3
     direction='declining' if slope<-0.005 else 'improving' if slope>0.005 else 'stable'
     dir_ar={'declining':'تراجع','improving':'تحسّن','stable':'استقرار'}[direction]
     level_ar='مرتفع' if (risk or 0)>=60 else 'متوسط' if (risk or 0)>=30 else 'منخفض'
     level_en='high' if (risk or 0)>=60 else 'medium' if (risk or 0)>=30 else 'low'
-    beats=mae_model<=mae_naive
-    return {'available':True,'method':'Holt damped trend (α=0.5, β=0.3, φ=0.85)','points':out,'trend_per_month':round(slope,4),
-      'direction':direction,'risk_pct':risk,'risk_level':level_en,'threshold':round(threshold,3) if threshold is not None else None,
-      'mae_model':round(mae_model,3),'mae_naive':round(mae_naive,3),'beats_naive':beats,'residual_sd':round(sd,3),
-      'explain_ar':(f"الاتجاه الحالي لمؤشر NDVI هو {dir_ar} بمعدل {slope:+.3f} شهريًا. نتوقع بعد 3 أشهر ({out[-1]['month_ar']}) قيمة {out[-1]['ndvi']:.2f} "
-                    f"ضمن نطاق {out[-1]['low']:.2f}–{out[-1]['high']:.2f} (ثقة 95%). احتمال أن ينخفض المؤشر تحت حد الإنذار ({threshold:.2f} = 85% من خط الأساس) "
-                    f"هو {risk}% أي خطر {level_ar}. " if threshold is not None else f"الاتجاه الحالي {dir_ar}. ")+
-                   (f"في اختبار آخر 3 أشهر كان متوسط خطأ النموذج {mae_model:.3f} مقابل {mae_naive:.3f} لطريقة «نفس قيمة الشهر السابق»، "
-                    +("فالنموذج أدق من الطريقة البسيطة." if beats else "أي أن النموذج لم يتفوّق بعد على الطريقة البسيطة؛ تعامل مع التنبؤ كمؤشر اتجاه فقط.")),
-      'explain_en':(f"NDVI is currently {direction} at {slope:+.3f} per month. In 3 months ({out[-1]['date'][:7]}) we expect {out[-1]['ndvi']:.2f} "
-                    f"(95% range {out[-1]['low']:.2f}–{out[-1]['high']:.2f}). Probability of falling below the alert line ({threshold:.2f} = 85% of baseline): {risk}% ({level_en} risk). " if threshold is not None else f"Trend: {direction}. ")+
-                   f"Back-test on the last 3 months: model error {mae_model:.3f} vs {mae_naive:.3f} for 'same as last month'"+(" — the model is more accurate." if beats else " — the model does not yet beat the simple method; treat it as a trend indicator only.")}
+    naive=scores.get('naive');beats=best!='naive' and naive is not None and scores[best]<naive
+    gain=round(100*(1-scores[best]/naive)) if (naive and best!='naive') else 0
+    board=[{'model':n,'label_ar':cands[n][2],'label_en':cands[n][3],'mae':round(v,4),'chosen':n==best} for n,v in sorted(scores.items(),key=lambda x:x[1])]
+    seasonal=best in ('holt_winters','seasonal_naive')
+    return {'available':True,'method':label_en,'method_ar':label_ar,'model':best,'leaderboard':board,'months_used':len(y),'test_months':k,
+      'points':out,'trend_per_month':round(slope,4),'direction':direction,'risk_pct':risk,'risk_level':level_en,
+      'threshold':round(threshold,3) if threshold is not None else None,'mae_model':round(scores[best],3),'mae_naive':round(naive,3) if naive else None,
+      'beats_naive':beats,'residual_sd':round(sd,3),'seasonal':seasonal,
+      'explain_ar':(f"اعتمادًا على {len(y)} شهرًا من القراءات، الاتجاه المتوقع {dir_ar}. نتوقع بعد 3 أشهر ({out[-1]['month_ar']}) قيمة {out[-1]['ndvi']:.2f} "
+                    f"ضمن نطاق {out[-1]['low']:.2f}–{out[-1]['high']:.2f} (ثقة 95%). احتمال أن ينخفض المؤشر تحت حد الإنذار ({threshold:.2f} = 85% من خط الأساس) هو {risk}% أي خطر {level_ar}. " if threshold is not None else f"الاتجاه المتوقع {dir_ar}. ")+
+                   f"قارنّا {len(scores)} نماذج على آخر {k} أشهر واخترنا الأدق: {label_ar} (متوسط الخطأ {scores[best]:.3f}"+(f"، أدق بنسبة {gain}% من الطريقة البسيطة)." if beats else ")؛ لم يتفوّق أي نموذج على الطريقة البسيطة بعد، فالتنبؤ مؤشر اتجاه فقط.")+
+                   (" النموذج يراعي التغير الموسمي السنوي (صيف/شتاء)." if seasonal else (" عند توفر 24 شهرًا أو أكثر يُضاف نموذج موسمي سنوي." if len(y)<24 else "")),
+      'explain_en':f"Based on {len(y)} months; best of {len(scores)} models on the last {k} months: {label_en} (MAE {scores[best]:.3f}"+(f", {gain}% better than naive)." if beats else "); no model beats naive yet.")}
 
 # Recommendations now come from maintenance_engine.py (team notebook), see build_insight().
 _DX={'insufficient':('بيانات غير كافية للتشخيص','Not enough data to diagnose'),'healthy':('حالة سليمة ومستقرة','Healthy and stable'),
  'improving':('تحسّن في الغطاء النباتي','Vegetation improving'),'water_stress':('إجهاد مائي محتمل (نقص ري)','Probable water stress (under-irrigation)'),
  'waterlogging':('تشبّع مائي أو تسرّب محتمل','Probable waterlogging or leak'),'salinity':('إجهاد ملحي محتمل','Probable salinity stress'),
  'nutrition':('نقص تغذية/كلوروفيل محتمل','Probable nutrient / chlorophyll deficiency'),'patchy_damage':('تلف موضعي في أجزاء من الحديقة','Localised damage in parts of the park'),
- 'maintenance':('انخفاض متوقّع بسبب صيانة مجدولة','Expected dip from scheduled maintenance'),'unexplained':('تراجع غير مفسَّر يحتاج تحققًا ميدانيًا','Unexplained decline needing a field check')}
+ 'maintenance':('انخفاض متوقّع بسبب صيانة مجدولة','Expected dip from scheduled maintenance'),'heat_stress':('إجهاد حراري محتمل','Probable heat stress'),'unexplained':('تراجع غير مفسَّر يحتاج تحققًا ميدانيًا','Unexplained decline needing a field check')}
 
 def build_insight(area,peers=None):
     m=area['metrics'];obs=[r for r in m['observations'] if _fin(r.get('ndvi')) and (r.get('valid_pixels_pct') or 0)>=60]
@@ -460,6 +511,8 @@ def build_insight(area,peers=None):
           maintenance_plan=maintenance_engine(tree_type=area.get('plants') or None,diagnosis='insufficient',confidence='Low',month=datetime.now(timezone.utc).month).to_dict())
         return res
     hist=obs[:-2] if len(obs)>=4 else obs[:-1];latest=obs[-1];prev=obs[-2]
+    _ss=same_season(obs,latest)
+    if len(_ss)>=3: hist=_ss
     refs={k:_ref(hist,k) for k in _FLOOR}
     z={k:_z(latest.get(k),refs[k]) for k in _FLOOR}
     base=m['baseline'] if _fin(m.get('baseline')) else refs['ndvi']['median']
@@ -493,7 +546,30 @@ def build_insight(area,peers=None):
     zc=zline('ndre','NDRE (الكلوروفيل)','NDRE (chlorophyll)','NDRE يعكس الكلوروفيل والتغذية؛ انخفاضه مع رطوبة طبيعية يشير لنقص تغذية.','NDRE reflects chlorophyll/nutrition.')
     zs=zline('salinity','SI (مؤشر الملوحة التقريبي)','SI (approx. salinity)','SI مؤشر سطوع يرتفع مع القشور الملحية والتربة المكشوفة، وهو تقريبي.','SI is a brightness index that rises with salt crusts and bare soil; approximate.')
     zp=zline('ndvi_std','تباين NDVI داخل الحديقة','Within-park NDVI variability','ارتفاع التباين يعني أن أجزاء من الحديقة تتدهور بينما أخرى سليمة.','Higher variability means some parts decline while others stay healthy.')
+    # --- thermal (Landsat 8/9): park surface temperature and its cooling effect vs ~300 m surroundings
+    th=[t for t in (area.get('thermal') or []) if _fin(t.get('lst_park'))]
+    z_lst=None;cooling=None;z_cool=None
+    if len(th)>=3:
+        tl=th[-1];tm=int(tl['measured_at'][5:7])
+        same=[t for t in th[:-1] if min((int(t['measured_at'][5:7])-tm)%12,(tm-int(t['measured_at'][5:7]))%12)<=1]
+        ref_rows=same if len(same)>=2 else th[:-1]
+        lst_ref={'median':statistics.median([t['lst_park'] for t in ref_rows]),'std':max(statistics.pstdev([t['lst_park'] for t in ref_rows]),0.7)}
+        z_lst=(tl['lst_park']-lst_ref['median'])/lst_ref['std']
+        add('lst','LST (حرارة سطح الحديقة °م)','LST (park surface °C)',tl['lst_park'],f"المعتاد لهذا الوقت {lst_ref['median']:.1f} ± {lst_ref['std']:.1f} · الانحراف {z_lst:+.1f}σ",'bad' if z_lst>=1 else 'ok',
+            f"حرارة سطح الحديقة من القمر Landsat ({tl['measured_at'][:7]}) {tl['lst_park']:.1f}°م، والمعتاد لهذا الوقت من السنة {lst_ref['median']:.1f}°م؛ أي {abs(z_lst):.1f} انحراف معياري {'فوق' if z_lst>0 else 'تحت'} المعتاد. ارتفاعها يعني أن النبات يفقد قدرته على التبريد بالنتح.",
+            f"Park surface temperature (Landsat) {tl['lst_park']:.1f}°C vs usual {lst_ref['median']:.1f}°C ({z_lst:+.1f}σ).")
+        cools=[t['lst_ring']-t['lst_park'] for t in th if _fin(t.get('lst_ring'))]
+        if _fin(tl.get('lst_ring')):
+            cooling=tl['lst_ring']-tl['lst_park']
+            if len(cools)>=3:
+                cm=statistics.median(cools[:-1]);cs=max(statistics.pstdev(cools[:-1]),0.4);z_cool=(cooling-cm)/cs
+                add('cooling','تأثير التبريد (°م أبرد من محيطها)','Cooling effect (°C cooler than surroundings)',cooling,f"المعتاد {cm:.1f}°م · الانحراف {z_cool:+.1f}σ",'bad' if z_cool<=-1 else 'good' if cooling>=1 else 'ok',
+                    f"الحديقة أبرد من محيطها العمراني (حزام ~300 م) بـ {cooling:.1f}°م، والمعتاد {cm:.1f}°م. تراجع هذا الفرق يعني ضعف دور الحديقة في تلطيف الحرارة.",
+                    f"Park is {cooling:.1f}°C cooler than its ~300 m surroundings (usual {cm:.1f}°C).")
+    summer=month in (5,6,7,8,9,10)
     scores={}
+    if decline and z_lst is not None and z_lst>=1 and (z_cool is None or z_cool<=-0.5):
+        scores['heat_stress']=2+(0.5 if summer else 0)+(0.5 if z_lst>=1.5 else 0)
     if decline:
         if zw is not None and zw<=-1: scores['water_stress']=2+(1 if strong else 0)+(1 if zw<=-1.5 else 0)
         if zl is not None and zl>=1 and (zw is None or zw>-0.5): scores['waterlogging']=2+(1 if zl>=1.5 else 0)
@@ -549,8 +625,10 @@ def build_insight(area,peers=None):
                      'action_en':'At replacement, choose coastal/saline-suited species from the approved list: '+', '.join(p['scientific'] for p in salt_tolerant())+'.',
                      'priority':'low','timeframe_ar':'عند الاستبدال','timeframe_en':'at replacement','owner_ar':'الجهة الرقابية','owner_en':'Regulator'})
     v_ar,v_en=plan['success_indicator_ar'],plan['success_indicator']
-    sev={'water_stress':3,'waterlogging':3,'patchy_damage':3,'salinity':2,'nutrition':2,'unexplained':3,'maintenance':1,'healthy':0,'improving':0}.get(dx,0)
+    sev={'water_stress':3,'waterlogging':3,'patchy_damage':3,'heat_stress':3,'salinity':2,'nutrition':2,'unexplained':3,'maintenance':1,'healthy':0,'improving':0}.get(dx,0)
     risk_score=min(100,round(sev*18+max(0,-chg)*0.8+((fc.get('risk_pct') or 0)*0.25 if fc.get('available') else 0)))
+    res['features']={'ndvi_change_pct':chg,'z_ndmi':zw,'z_ndwi':zl,'z_ndre':zc,'z_salinity':zs,'z_ndvi_std':zp,'ndvi':latest['ndvi'],
+        'z_lst':z_lst,'cooling':cooling,'coastal':1 if coastal else 0,'maint_month':1 if maint else 0,'summer':1 if summer else 0}
     res.update(diagnosis=dx,title_ar=title_ar,title_en=title_en,confidence=confidence,confidence_ar=conf_ar,evidence=ev,alternatives=alts,
       notes_ar=notes_ar,notes_en=notes_en,summary_ar=summary_ar,summary_en=summary_en,forecast=fc,recommendations=recs,verify_ar=v_ar,verify_en=v_en,
       maintenance_plan=plan,species=[{k:p[k] for k in ('name_ar','scientific','category_ar','irrigation_ar','irrigation_en','coastal')} for p in species],species_summary=sp_sum,risk_score=risk_score,latest_date=latest['measured_at'],baseline=round(base,3) if base is not None else None,change_pct=round(chg,1),
@@ -565,13 +643,48 @@ def build_insight(area,peers=None):
 def attach_insights(areas):
     peers=[(a['metrics']['observations'] or [{}])[-1].get('salinity') for a in areas if a['metrics']['observations']]
     for a in areas: a['insight']=build_insight(a,peers)
+    st,clf=model_state(peers)
+    for a in areas:
+        ins=a['insight']
+        if clf is not None and ins.get('features'):
+            pred=rawaa_ml.predict(clf,ins['features'])
+            ins['ml']={'trained':True,'predictions':pred,'agrees':pred[0]['cause']==ins['diagnosis'],'cv_accuracy':st.get('cv_accuracy'),
+                       'rules_accuracy':st.get('rules_accuracy'),'labels':st['labels'],'importances':st.get('importances',[])[:3]}
+        else:
+            ins['ml']={'trained':False,'labels':st['labels'],'min_labels':st['min_labels'],'reason_ar':st.get('reason_ar')}
     return areas
+
+def label_samples(peers=None):
+    """Pair each confirmed cause with the site's satellite features as they were on that date."""
+    with connect() as db:
+        labels=[dict(r) for r in db.execute('SELECT * FROM labels ORDER BY observed_on')]
+        if not labels: return [],[]
+        areas={r['id']:dict(r) for r in db.execute('SELECT * FROM areas')}
+        obs={};th={}
+        for r in db.execute('SELECT * FROM observations ORDER BY measured_at'): obs.setdefault(r['area_id'],[]).append(dict(r))
+        for r in db.execute('SELECT * FROM thermal ORDER BY measured_at'): th.setdefault(r['area_id'],[]).append(dict(r))
+    samples=[];rules=[]
+    for lb in labels:
+        a=areas.get(lb['area_id'])
+        if not a: continue
+        cut=lb['observed_on'][:10]
+        rows=[r for r in obs.get(a['id'],[]) if r['measured_at']<=cut]
+        area={**a,'metrics':metrics_from_rows(rows),'thermal':[t for t in th.get(a['id'],[]) if t['measured_at']<=cut]}
+        ins=build_insight(area,peers)
+        if ins.get('features'):
+            samples.append((ins['features'],lb['cause']));rules.append(ins['diagnosis'])
+    return samples,rules
+
+def model_state(peers=None):
+    samples,rules=label_samples(peers)
+    return rawaa_ml.status(samples,rules)
 
 
 def full_area(db,r):
     d=dict(r)
     d['geometry']=json.loads(d['geometry'])
     d['metrics']=metrics(d['id'],db)
+    d['thermal']=[dict(x) for x in db.execute('SELECT measured_at,lst_park,lst_ring,valid_pixels_pct FROM thermal WHERE area_id=? ORDER BY measured_at',(d['id'],))]
     d.update(SITE_INFO.get(d['name_en'],{}))
     return d
 
@@ -714,6 +827,61 @@ def set_area_plants(area_id:int,v:PlantsUpdate,req:Request):
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',(u['id'],'set_plants',str(area_id),f'{len(v.plants)} species',utcnow()))
     return {'ok':True,'count':len(v.plants)}
 
+@app.get('/api/model')
+def model_info(req:Request):
+    """Learning-model status: labels, validation accuracy vs rules, top features."""
+    current_user(req)
+    st,_clf=model_state()
+    st['causes']={k:{'ar':v[0],'en':v[1]} for k,v in rawaa_ml.CAUSES.items()}
+    return st
+
+class LabelIn(BaseModel):
+    area_id:int;observed_on:str;cause:str;notes:str=''
+
+@app.get('/api/labels')
+def labels_list(req:Request):
+    u=current_user(req);require_regulator(u)
+    with connect() as db: return [dict(r) for r in db.execute('SELECT * FROM labels ORDER BY observed_on DESC')]
+
+def _add_label(db,area_id,observed_on,cause,source,notes='',task_id=None):
+    if cause not in rawaa_ml.CAUSES: raise HTTPException(400,'Unknown cause: '+cause)
+    try: date.fromisoformat(observed_on[:10])
+    except ValueError: raise HTTPException(400,'observed_on must be YYYY-MM-DD')
+    if not db.execute('SELECT 1 FROM areas WHERE id=?',(area_id,)).fetchone(): raise HTTPException(404,'Area not found')
+    db.execute('INSERT INTO labels(area_id,observed_on,cause,source,notes,task_id,created_at) VALUES(?,?,?,?,?,?,?)',
+               (area_id,observed_on[:10],cause,source,notes[:400],task_id,utcnow()))
+
+@app.post('/api/labels',status_code=201)
+def labels_add(v:LabelIn,req:Request):
+    u=current_user(req);require_regulator(u)
+    with connect() as db: _add_label(db,v.area_id,v.observed_on,v.cause,'field',v.notes)
+    return {'ok':True}
+
+@app.delete('/api/labels/{label_id}')
+def labels_delete(label_id:int,req:Request):
+    u=current_user(req);require_regulator(u)
+    with connect() as db: db.execute('DELETE FROM labels WHERE id=?',(label_id,))
+    return {'ok':True}
+
+class LabelsCSV(BaseModel):
+    csv_text:str=Field(min_length=10,max_length=500_000)
+
+@app.post('/api/labels/import-csv')
+def labels_import(v:LabelsCSV,req:Request):
+    """Municipality records: columns site (id, English or Arabic name), date (YYYY-MM-DD), cause, notes (optional)."""
+    u=current_user(req);require_regulator(u)
+    rows=list(csv.DictReader(io.StringIO(v.csv_text.strip())))
+    ok=0;errors=[]
+    with connect() as db:
+        areas=[dict(r) for r in db.execute('SELECT id,name_en,name_ar FROM areas')]
+        for i,r in enumerate(rows,start=2):
+            site=(r.get('site') or r.get('area') or r.get('area_id') or '').strip()
+            a=next((x for x in areas if site in (str(x['id']),x['name_en'],x['name_ar'])),None)
+            if not a: errors.append(f'row {i}: unknown site {site!r}');continue
+            try:_add_label(db,a['id'],(r.get('date') or '').strip(),(r.get('cause') or '').strip(),'import',(r.get('notes') or '').strip());ok+=1
+            except HTTPException as ex: errors.append(f'row {i}: {ex.detail}')
+    return {'imported':ok,'errors':errors[:20]}
+
 @app.get('/api/maintenance-plan')
 def maintenance_plan_api(req:Request,diagnosis:str,confidence:str='Medium',tree_type:str='',month:int=0):
     """Run the Maintenance Engine directly (same inputs as the team notebook)."""
@@ -811,6 +979,7 @@ def list_tasks(req:Request):
 
 class TaskPatch(BaseModel):
     status:str|None=None
+    confirmed_cause:str|None=None
     actual_cause:str|None=None
     action:str|None=None
     notes:str|None=None
@@ -836,6 +1005,11 @@ def patch_task(task_id:int,v:TaskPatch,req:Request):
         fields['updated_at']=utcnow()
         sql='UPDATE tasks SET '+', '.join(f'{k}=?' for k in fields)+' WHERE id=?'
         db.execute(sql,[*fields.values(),task_id])
+        if fields.get('confirmed_cause') and fields['confirmed_cause'] not in rawaa_ml.CAUSES:
+            raise HTTPException(400,'Unknown confirmed cause')
+        if v.status=='closed':
+            cause=fields.get('confirmed_cause') or t['confirmed_cause']
+            if cause: _add_label(db,t['area_id'],t['created_at'][:10],cause,'task',(t['actual_cause'] or '')[:400],task_id)
         if v.status=='closed' and t['alert_id']:
             db.execute('UPDATE alerts SET status=\'closed\' WHERE id=?',(t['alert_id'],))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
@@ -1103,14 +1277,65 @@ def sentinel_tile(layer:str,z:int,x:int,y:int,req:Request,month:str='',cc:int=30
         pass
     return Response(data,media_type='image/png',headers=hdr)
 
+LST_EVALSCRIPT = """//VERSION=3
+// Land-surface temperature (°C) from Landsat 8/9 TIRS band 10 brightness temperature (Kelvin),
+// corrected with NDVI-based emissivity (single-channel method). Cold pixels (<270 K, likely cloud) are excluded.
+function setup(){return {input:[{bands:["B04","B05","B10","dataMask"]}],
+  output:[{id:"lst",bands:1,sampleType:"FLOAT32"},{id:"valid",bands:1,sampleType:"FLOAT32"},{id:"dataMask",bands:1}]};}
+function evaluatePixel(s){
+  let bt=s.B10, ok=s.dataMask===1 && bt>270 && bt<345;
+  if(!ok) return {lst:[NaN],valid:[0],dataMask:[s.dataMask]};
+  let ndvi=(s.B05+s.B04)!==0?(s.B05-s.B04)/(s.B05+s.B04):0;
+  let pv=Math.pow(Math.min(1,Math.max(0,(ndvi-0.2)/0.3)),2);
+  let e= ndvi<0?0.991 : ndvi<0.2?0.966 : ndvi>0.5?0.99 : 0.004*pv+0.986;
+  let lst=bt/(1+(10.895*bt/14388)*Math.log(e));
+  return {lst:[lst-273.15],valid:[1],dataMask:[s.dataMask]};
+}"""
+
+def _ring_polygon(polygon,margin=0.003):
+    """~300 m belt around the park (bbox grown by margin, park cut out as a hole) = its urban surroundings."""
+    ring=polygon['coordinates'][0];xs=[float(p[0]) for p in ring];ys=[float(p[1]) for p in ring]
+    x0,y0,x1,y1=min(xs)-margin,min(ys)-margin,max(xs)+margin,max(ys)+margin
+    outer=[[x0,y0],[x1,y0],[x1,y1],[x0,y1],[x0,y0]]
+    hole=list(reversed(ring)) if ring[0]==ring[-1] else list(reversed(ring+[ring[0]]))
+    return {'type':'Polygon','coordinates':[outer,hole]}
+
+def _thermal_stats(geometry,start,end,tok):
+    req={'input':{'bounds':{'geometry':geometry,'properties':{'crs':'http://www.opengis.net/def/crs/EPSG/0/4326'}},
+                  'data':[{'type':'landsat-ot-l1','dataFilter':{'maxCloudCoverage':40,'mosaickingOrder':'leastCC'}}]},
+         'aggregation':{'timeRange':{'from':f'{start}T00:00:00Z','to':f'{end}T23:59:59Z'},'aggregationInterval':{'of':'P30D'},
+                        'lastIntervalBehavior':'SHORTEN','evalscript':LST_EVALSCRIPT,'resx':0.0003,'resy':0.0003}}
+    res=api_json('https://sh.dataspace.copernicus.eu/statistics/v1',req,{'Content-Type':'application/json','Authorization':'Bearer '+tok},timeout=120)
+    out={}
+    for item in res.get('data',[]):
+        o=item.get('outputs',{})
+        m=o.get('lst',{}).get('bands',{}).get('B0',{}).get('stats',{}).get('mean')
+        v=o.get('valid',{}).get('bands',{}).get('B0',{}).get('stats',{}).get('mean')
+        if isinstance(m,(int,float)) and math.isfinite(m) and isinstance(v,(int,float)) and math.isfinite(v):
+            out[item['interval']['from'][:10]]=(m,v*100)
+    return out
+
+def sync_thermal(area_id,polygon,start,end,tok):
+    park=_thermal_stats(polygon,start,end,tok);ring=_thermal_stats(_ring_polygon(polygon),start,end,tok)
+    saved=0
+    with connect() as db:
+        for d,(lst,pct) in park.items():
+            if pct<50: continue
+            rl=ring.get(d,(None,0))
+            db.execute('''INSERT INTO thermal(area_id,measured_at,lst_park,lst_ring,valid_pixels_pct,created_at) VALUES(?,?,?,?,?,?)
+                ON CONFLICT(area_id,measured_at) DO UPDATE SET lst_park=excluded.lst_park,lst_ring=excluded.lst_ring,valid_pixels_pct=excluded.valid_pixels_pct''',
+                (area_id,d,round(lst,2),round(rl[0],2) if rl[0] is not None and rl[1]>=50 else None,round(pct,1),utcnow()))
+            saved+=1
+    return saved
+
 @app.post('/api/areas/{area_id}/sync-satellite')
 def sync_satellite(area_id:int,v:Sync,req:Request):
     u=current_user(req);require_regulator(u)
     client_id=os.getenv('COPERNICUS_CLIENT_ID');secret=os.getenv('COPERNICUS_CLIENT_SECRET')
     if not client_id or not secret: raise HTTPException(422,'Configure Copernicus OAuth credentials in server environment first')
     end=date.fromisoformat(v.end_date) if v.end_date else date.today()
-    start=date.fromisoformat(v.start_date) if v.start_date else end-timedelta(days=365)
-    if start>=end or (end-start).days>730: raise HTTPException(400,'Date range must be 1–730 days')
+    start=date.fromisoformat(v.start_date) if v.start_date else end-timedelta(days=3*365)
+    if start>=end or (end-start).days>4*365: raise HTTPException(400,'Date range must be 1–1460 days')
     with connect() as db:
         a=area_access(db,u,area_id)
         polygon=json.loads(a['geometry'])
@@ -1156,7 +1381,12 @@ def sync_satellite(area_id:int,v:Sync,req:Request):
             saved+=1
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
                    (u['id'],'satellite_sync',str(area_id),f'{saved} periods, {skipped} excluded',utcnow()))
-    return {'saved_intervals':saved,'excluded_intervals':skipped,'source':'Copernicus Sentinel-2 L2A','note':'Each output is one composited 30-day interval, not a single-image acquisition.'}
+    thermal_saved=0;thermal_err=None
+    try:
+        thermal_saved=sync_thermal(area_id,polygon,start,end,tok)
+    except Exception as ex:  # thermal is optional; vegetation readings are already saved
+        thermal_err=str(ex)[:200]
+    return {'thermal_intervals':thermal_saved,'thermal_error':thermal_err,'saved_intervals':saved,'excluded_intervals':skipped,'source':'Copernicus Sentinel-2 L2A','note':'Each output is one composited 30-day interval, not a single-image acquisition.'}
 
 
 @app.post('/api/areas/{area_id}/scan')

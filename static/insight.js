@@ -1,5 +1,5 @@
 /* RAWAA intelligence UI: diagnosis → forecast → maintenance plan (Maintenance Engine), each explaining its own numbers. */
-const DX_TONE={healthy:'good',improving:'good',maintenance:'info',insufficient:'muted',water_stress:'bad',waterlogging:'bad',patchy_damage:'bad',unexplained:'bad',salinity:'warn',nutrition:'warn'};
+const DX_TONE={healthy:'good',improving:'good',maintenance:'info',insufficient:'muted',water_stress:'bad',waterlogging:'bad',patchy_damage:'bad',unexplained:'bad',salinity:'warn',nutrition:'warn',heat_stress:'bad'};
 const CONF_AR={high:'مرتفعة',medium:'متوسطة',low:'منخفضة'};
 const PRI_AR={high:'عالية',medium:'متوسطة',low:'منخفضة'};
 const GLOSSARY=[
@@ -8,6 +8,8 @@ const GLOSSARY=[
  ['NDWI','الماء المكشوف والتربة المشبعة','Open water / saturated soil','(B3 − B8)/(B3 + B8)','ارتفاعه فوق المعتاد يعني تجمع مياه أو تسربًا','A rise above usual suggests ponding or leaks'],
  ['NDRE','الكلوروفيل والتغذية','Chlorophyll / nutrition','(B8A − B5)/(B8A + B5)','انخفاضه مع رطوبة طبيعية يشير لنقص تغذية','A drop with normal moisture suggests nutrient deficiency'],
  ['SI','مؤشر ملوحة تقريبي','Approximate salinity index','√(B2 × B4)','يرتفع مع القشور الملحية والتربة المكشوفة؛ يحتاج تأكيدًا بقياس EC','Rises with salt crusts/bare soil; confirm with EC'],
+ ['LST','حرارة سطح الأرض (°م)','Land-surface temperature','Landsat 8/9 B10 + emissivity','ارتفاعها عن المعتاد لنفس الوقت من السنة يعني أن النبات يفقد قدرته على التبريد','Above the usual for this time of year = losing evaporative cooling'],
+ ['Δ°','تأثير التبريد','Cooling effect','LST المحيط − LST الحديقة','كم درجة الحديقة أبرد من حزام عمراني ~300 م حولها؛ تراجعه علامة إجهاد حراري','How much cooler the park is than a ~300 m urban belt around it'],
  ['σ','الانحراف المعياري','Standard deviation','—','مقدار التذبذب المعتاد لقراءات الحديقة؛ الابتعاد 1σ أو أكثر عن المعتاد يُعد ملحوظًا','Usual fluctuation; ≥1σ away is notable'],
 ];
 function glossaryBlock(){return `<details class="ins-details"><summary>${icon('info',15)} ${ar()?'كيف أقرأ هذه الأرقام؟':'How do I read these numbers?'}</summary><div class="glossary">${GLOSSARY.map(g=>`<div class="gl-row"><b>${g[0]}</b><div><span>${ar()?g[1]:g[2]}</span><code>${g[3]}</code><small>${ar()?g[4]:g[5]}</small></div></div>`).join('')}</div></details>`}
@@ -20,6 +22,7 @@ function diagnosisCard(a){const i=a?.insight;if(!i)return '';const tone=DX_TONE[
  <div class="table-wrap"><table class="ev-table"><thead><tr><th>${ar()?'المؤشر':'Index'}</th><th>${ar()?'القيمة':'Value'}</th><th>${ar()?'مقارنة بمعتاد الحديقة':'vs park’s usual'}</th><th>${ar()?'الحكم':'Verdict'}</th></tr></thead><tbody>${rows}</tbody></table></div>
  ${i.alternatives?.length?`<p class="ins-alt"><b>${ar()?'احتمالات أخرى:':'Other possibilities:'}</b> ${i.alternatives.map(x=>esc(ar()?x.title_ar:x.title_en)).join(' · ')}</p>`:''}
  ${(ar()?i.notes_ar:i.notes_en)?.length?`<ul class="ins-notes">${(ar()?i.notes_ar:i.notes_en).map(n=>`<li>${esc(n)}</li>`).join('')}</ul>`:''}
+${mlBlock(i)}
  <details class="ins-details"><summary>${icon('book-open',15)} ${ar()?'كيف وصلنا لهذا التشخيص؟':'How was this diagnosis made?'}</summary><p>${esc(ar()?i.method_ar:i.method_en)}</p><p class="muted">${ar()?'نافذة المقارنة':'Comparison window'}: ${esc(i.data_quality?.history_window||'—')} · ${ar()?'عدد القراءات الصالحة':'valid readings'}: ${i.data_quality?.n} · ${ar()?'صفاء آخر قراءة':'last clear-sky share'}: ${i.data_quality?.latest_valid_pct}%</p></details>
  ${glossaryBlock()}</div>`}
 
@@ -44,7 +47,8 @@ function forecastCard(a){const i=a?.insight,f=i?.forecast;if(!i)return '';
  ${forecastSvg(a,f)}
  <div class="fc-points">${f.points.map(p=>`<div><span>${ar()?p.month_ar:p.date.slice(0,7)}</span><b>${p.ndvi.toFixed(2)}</b><small>${p.low.toFixed(2)} – ${p.high.toFixed(2)}</small></div>`).join('')}</div>
  <p class="ins-sum">${esc(ar()?f.explain_ar:f.explain_en)}</p>
- <details class="ins-details"><summary>${icon('book-open',15)} ${ar()?'كيف حُسب التنبؤ؟':'How is it calculated?'}</summary><p>${ar()?`نموذج ${f.method}: يتابع مستوى المؤشر واتجاهه الشهري مع إخماد الاتجاه تدريجيًا حتى لا يبالغ في الامتداد. نطاق الثقة من أخطاء النموذج السابقة (الانحراف ${f.residual_sd}). احتمال الخطر = احتمال أن تقع قيمة الشهر الثالث تحت حد الإنذار. اختبار الدقة: خطأ النموذج ${f.mae_model} مقابل ${f.mae_naive} للطريقة البسيطة.`:`${f.method}: tracks level and monthly trend, damping the trend. Range from past errors (sd ${f.residual_sd}). Risk = probability month-3 value falls below the alert line. Back-test error ${f.mae_model} vs naive ${f.mae_naive}.`}</p></details></div>`}
+ <details class="ins-details"><summary>${icon('book-open',15)} ${ar()?'كيف حُسب التنبؤ؟ (مقارنة النماذج)':'How is it calculated? (model comparison)'}</summary><p>${ar()?`جُرّبت عدة نماذج على آخر ${f.test_months} أشهر (كأنها مستقبل لم يُرَ) واختير صاحب أقل خطأ. البيانات: ${f.months_used} شهرًا من Sentinel-2. نطاق الثقة من أخطاء النموذج السابقة (الانحراف ${f.residual_sd}). احتمال الخطر = احتمال أن تقع قيمة الشهر الثالث تحت حد الإنذار.`:`Several models were tested on the last ${f.test_months} months; the most accurate was chosen. ${f.months_used} months of Sentinel-2 data.`}</p>
+ <table class="ev-table lb"><thead><tr><th>${ar()?'النموذج':'Model'}</th><th>${ar()?'متوسط الخطأ (MAE)':'MAE'}</th><th></th></tr></thead><tbody>${(f.leaderboard||[]).map(m=>`<tr class="${m.chosen?'chosen':''}"><td>${esc(ar()?m.label_ar:m.label_en)}</td><td class="num">${m.mae.toFixed(4)}</td><td>${m.chosen?`<span class="verdict good">${ar()?'المُختار':'chosen'}</span>`:''}</td></tr>`).join('')}</tbody></table></details></div>`}
 
 function planCard(a){const i=a?.insight,p=i?.maintenance_plan;if(!p)return '';const reg=S.user?.role==='regulator';
  const canAlert=reg&&!['healthy','improving','insufficient','maintenance'].includes(i.diagnosis);
@@ -97,6 +101,7 @@ const TIPS={
  SAVI:a=>ar()?'مثل NDVI لكنه يقلل تأثير التربة المكشوفة، فيفيد في الحدائق قليلة الكثافة.':'Like NDVI but reduces bare-soil influence.',
  NDWI:a=>ar()?'مؤشر الماء (B3−B8)/(B3+B8). ارتفاعه فوق المعتاد يعني تجمّع مياه أو تسربًا أو تشبع التربة.':'Water index; a rise suggests ponding or leaks.',
  SI:a=>ar()?'مؤشر ملوحة تقريبي √(B2×B4) يرتفع مع القشور الملحية والتربة المكشوفة. يحتاج تأكيدًا بقياس ملوحة التربة (EC).':'Approximate salinity index; confirm with soil EC.',
+ LST:a=>ar()?'حرارة سطح الحديقة من Landsat 8/9 (°م) مصححة بالانبعاثية؛ تُقارن بالمعتاد لنفس الوقت من السنة.':'Landsat surface temperature.',
  STD:a=>ar()?'مدى اختلاف NDVI بين أجزاء الحديقة. ارتفاعه يعني أن بعض الأجزاء تتدهور بينما غيرها سليم (مثل عطل خط ري فرعي).':'NDVI variability inside the park; a rise means patchy damage.',
  allAreas:a=>ar()?'عدد الحدائق والمواقع المسجلة في المنصة.':'Number of monitored sites.',
  stableC:a=>ar()?'حدائق تراجعها عن خط الأساس أقل من 10%.':'Sites with decline under 10%.',
@@ -104,3 +109,32 @@ const TIPS={
  highC:a=>ar()?'حدائق تراجعت 20% أو أكثر في آخر قراءتين، وأولوية للتحقق الميداني.':'Sites down 20%+ in the last two readings.',
 };
 function tip(key,a){const f=TIPS[key];if(!f)return '';const text=f(a);return `<button type="button" class="tip" data-action="tip" aria-label="${esc(text)}" data-tip="${esc(text)}">!</button>`}
+
+/* Learning model: shown inside the diagnosis card. */
+function mlBlock(i){const m=i.ml;if(!m)return '';
+ if(!m.trained){const pct=Math.min(100,Math.round(100*(m.labels||0)/(m.min_labels||10)));return `<div class="ml-box"><b>${icon('cpu',15)} ${ar()?'النموذج المدرَّب':'Trained model'}</b><p>${esc(m.reason_ar||'')}</p><div class="progress" style="margin-top:6px"><div style="width:${pct}%"></div></div><small class="muted">${ar()?`${m.labels} من ${m.min_labels} سجلات مؤكدة. التشخيص الحالي من القواعد الشفافة.`:`${m.labels}/${m.min_labels} confirmed records.`}</small></div>`}
+ const p=m.predictions||[];return `<div class="ml-box"><b>${icon('cpu',15)} ${ar()?'رأي النموذج المدرَّب على سجلات الأمانة':'Model trained on confirmed records'}</b>
+ <div class="ml-preds">${p.map((x,k)=>`<div class="${k===0?'top':''}"><span>${esc(ar()?x.label_ar:x.label_en)}</span><i style="width:${x.probability}%"></i><b>${x.probability}%</b></div>`).join('')}</div>
+ <p class="${m.agrees?'tone-good':'tone-warn'}" style="font-size:12px;margin:8px 0 4px">${m.agrees?(ar()?'✓ النموذج يتفق مع تشخيص القواعد.':'✓ Agrees with the rules.'):(ar()?'⚠ النموذج يرجّح سببًا مختلفًا عن القواعد؛ يُنصح بالتحقق الميداني من الاحتمالين.':'⚠ Model disagrees with the rules; verify both in the field.')}</p>
+ <small class="muted">${ar()?`تدرّب على ${m.labels} سجلًا مؤكدًا · دقة التحقق المتقاطع ${m.cv_accuracy??'—'}% مقابل ${m.rules_accuracy??'—'}% للقواعد على نفس السجلات · أهم العوامل: ${(m.importances||[]).map(x=>esc(x.label_ar)).join('، ')}`:`Trained on ${m.labels} records · CV accuracy ${m.cv_accuracy??'—'}% vs rules ${m.rules_accuracy??'—'}%`}</small></div>`}
+
+/* Heat stress list for the intelligence page. */
+function heatRows(){const rows=(S.data.areas||[]).map(a=>({a,th:(a.thermal||[]).filter(x=>Number.isFinite(x.lst_park)).at(-1),i:a.insight})).filter(x=>x.th);
+ if(!rows.length)return `<div class="empty"><b>${ar()?'لا توجد قراءات حرارية بعد':'No thermal readings yet'}</b>${ar()?'اضغطوا «جلب قراءات فضائية» في صفحة الحديقة؛ يجلب الزر الآن حرارة السطح من Landsat 8/9 أيضًا (دقة 30–100 م).':'Sync a park; it now also fetches Landsat 8/9 surface temperature.'}</div>`;
+ rows.sort((x,y)=>((x.th.lst_ring??x.th.lst_park)-x.th.lst_park)-((y.th.lst_ring??y.th.lst_park)-y.th.lst_park));
+ return `<p>${ar()?'حرارة سطح كل حديقة من Landsat 8/9 ومقدار تبريدها لمحيطها العمراني (~300 م). الأقل تبريدًا في الأعلى.':'Park surface temperature and cooling vs ~300 m surroundings; least cooling first.'}</p>`+rows.map(({a,th,i})=>{const c=Number.isFinite(th.lst_ring)?th.lst_ring-th.lst_park:null;return `<div class="analysis-row"><div><b>${esc(areaLabel(a))}</b><p>LST ${th.lst_park.toFixed(1)}°م${c!==null?` · ${ar()?'أبرد من محيطها بـ':'cooler by'} <b class="${c<1?'tone-bad':'tone-good'}">${c.toFixed(1)}°م</b>`:''} · ${esc(th.measured_at.slice(0,7))}${i?.diagnosis==='heat_stress'?` · <span class="tone-bad">${ar()?'إجهاد حراري محتمل':'probable heat stress'}</span>`:''}</p></div>${btn(t('areaDetails'),'open-area',{id:a.id})}</div>`}).join('')}
+
+/* Municipality records & training (reports page, regulator). */
+let MODEL_CACHE=null;
+async function loadModel(){try{MODEL_CACHE=await api('/model');const el=document.getElementById('model-panel');if(el)el.outerHTML=modelPanel()}catch(e){}}
+function modelPanel(){const m=MODEL_CACHE;if(!m)return `<div id="model-panel" class="surface ins-card"><p class="muted">${ar()?'جارٍ تحميل حالة النموذج…':'Loading model…'}</p></div>`;
+ return `<div id="model-panel" class="surface ins-card"><div class="ins-head"><span class="ins-step">${icon('cpu',16)}</span><div><small>${ar()?'التعلّم من سجلات الأمانة':'Learning from municipality records'}</small><h3>${m.trained?(ar()?'النموذج مدرَّب':'Model trained'):(ar()?'النموذج لم يتدرّب بعد':'Not trained yet')}</h3></div></div>
+ <div class="plan-meta"><div><span>${ar()?'سجلات مؤكدة':'Confirmed records'}</span><b>${m.labels}</b></div><div><span>${ar()?'دقة النموذج (تحقق متقاطع)':'Model CV accuracy'}</span><b>${m.cv_accuracy!=null?m.cv_accuracy+'%':'—'}</b></div><div><span>${ar()?'دقة القواعد على نفس السجلات':'Rules accuracy'}</span><b>${m.rules_accuracy!=null?m.rules_accuracy+'%':'—'}</b></div><div><span>${ar()?'الأسباب المسجلة':'Causes'}</span><b>${Object.keys(m.classes||{}).length}</b></div></div>
+ ${m.trained?'':`<p class="ins-sum">${esc(m.reason_ar||'')}</p>`}
+ ${Object.keys(m.classes||{}).length?`<p class="muted" style="font-size:12px">${Object.entries(m.classes).map(([k,v])=>`${esc((m.class_names_ar||{})[k]||k)}: ${v}`).join(' · ')}</p>`:''}
+ <p style="font-size:12px;line-height:1.9">${ar()?'مصادر التدريب: (1) عند إغلاق مهمة يختار المشغّل «السبب المؤكد» فيُحفظ تلقائيًا، (2) استيراد سجلات الأمانة كملف CSV. كل سجل يُربط بقراءات القمر الصناعي للحديقة في ذلك التاريخ، ثم يُقارن النموذج بالقواعد على السجلات نفسها — وهذا هو التحقق من صحة نتائج المنصة مقابل نتائج الأمانة.':'Sources: tasks closed with a confirmed cause, and imported municipality CSV records.'}</p>
+ ${btn(ar()?'استيراد سجلات الأمانة (CSV)':'Import municipality records (CSV)','import-labels',{primary:true,icon:'file-up'})}</div>`}
+function labelsModal(){const causes=MODEL_CACHE?.causes||{};openModal(`${modalHeader(ar()?'استيراد سجلات الأمانة':'Import municipality records',ar()?`الأعمدة: site (اسم الحديقة بالعربي أو الإنجليزي أو رقمها)، date (YYYY-MM-DD)، cause، notes. قيم cause المقبولة: ${Object.keys(causes).join(', ')}`:'Columns: site, date, cause, notes')}
+ <form id="labels-form"><textarea name="csv_text" required style="min-height:170px">site,date,cause,notes\nحديقة الهدى,2026-06-15,water_stress,عطل في مضخة الري\nPrince Majid Park,2026-03-10,maintenance,تهوية النجيل</textarea>
+ <div class="form-actions"><button type="button" class="btn" data-action="close-modal">${t('cancel')}</button><button type="submit" class="btn primary">${t('save')}</button></div></form>`)}
+const CAUSE_OPTS=[['water_stress','إجهاد مائي / نقص ري'],['waterlogging','تشبع مائي / تسرب'],['salinity','ملوحة'],['nutrition','نقص تغذية'],['patchy_damage','تلف موضعي (عطل خط ري/آفة)'],['heat_stress','إجهاد حراري'],['maintenance','أثر صيانة مجدولة'],['healthy','لا توجد مشكلة'],['other','سبب آخر']];

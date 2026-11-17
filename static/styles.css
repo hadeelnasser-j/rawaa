@@ -268,3 +268,7 @@ html[data-theme=dark] .irr.lo{background:#163826;color:#7ef1a8}html[data-theme=d
 html[data-theme=dark] .tip::after{background:#f2f7f4;color:#10231d}
 .tip-wrap{display:inline-flex;align-items:center;gap:2px}
 .key-value span{display:flex!important;align-items:center;gap:2px}
+
+.ml-box{margin-top:14px;border:1px dashed var(--line);border-radius:12px;padding:12px 14px;font-size:12px}.ml-box>b{display:flex;gap:6px;align-items:center;font-size:13px}.ml-box p{margin:6px 0}
+.ml-preds{display:grid;gap:6px;margin-top:8px}.ml-preds div{display:grid;grid-template-columns:160px 1fr 44px;gap:8px;align-items:center}.ml-preds i{height:8px;border-radius:6px;background:#9fb3aa;display:block}.ml-preds .top i{background:var(--accent)}.ml-preds .top span{font-weight:800}
+.lb tr.chosen td{font-weight:800}

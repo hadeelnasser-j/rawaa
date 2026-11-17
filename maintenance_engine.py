@@ -134,6 +134,13 @@ AI_RULES = {
         'actions_ar': ['معاينة البقع المتضررة (حددوها بطبقة NDVI على الخريطة)', 'إصلاح خط الري الفرعي المتضرر', 'فحص نشاط الآفات'],
         'success': 'NDVI variance decreases.', 'success_ar': 'انخفاض تباين NDVI داخل الحديقة.'},
     # added for the platform's other diagnoses
+    'heat_stress': {
+        'priority': 'High', 'deadline': '1 Week', 'deadline_ar': 'أسبوع', 'owner': 'Operator',
+        'actions': ['Move irrigation to night / early morning', 'Add short extra cycles during heat waves',
+                    'Mulch exposed beds to keep soil cool', 'Shade or relocate heat-sensitive species'],
+        'actions_ar': ['نقل الري إلى الليل أو الفجر لتقليل الفقد بالتبخر', 'إضافة دورات ري قصيرة أثناء موجات الحر',
+                       'تغطية الأحواض المكشوفة بالمَلش (Mulch) لتبريد التربة', 'تظليل الأنواع الحساسة للحرارة أو استبدالها بأنواع متحملة من القائمة المعتمدة'],
+        'success': 'Park LST falls and its cooling effect vs surroundings recovers.', 'success_ar': 'انخفاض حرارة سطح الحديقة وعودة فرق التبريد مع محيطها.'},
     'maintenance': {
         'priority': 'Low', 'deadline': '1 Week', 'deadline_ar': 'أسبوع', 'owner': 'Operator',
         'actions': ['Confirm the scheduled maintenance was carried out', 'Re-measure next month'],
