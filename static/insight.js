@@ -138,3 +138,13 @@ function labelsModal(){const causes=MODEL_CACHE?.causes||{};openModal(`${modalHe
  <form id="labels-form"><textarea name="csv_text" required style="min-height:170px">site,date,cause,notes\nحديقة الهدى,2026-06-15,water_stress,عطل في مضخة الري\nPrince Majid Park,2026-03-10,maintenance,تهوية النجيل</textarea>
  <div class="form-actions"><button type="button" class="btn" data-action="close-modal">${t('cancel')}</button><button type="submit" class="btn primary">${t('save')}</button></div></form>`)}
 const CAUSE_OPTS=[['water_stress','إجهاد مائي / نقص ري'],['waterlogging','تشبع مائي / تسرب'],['salinity','ملوحة'],['nutrition','نقص تغذية'],['patchy_damage','تلف موضعي (عطل خط ري/آفة)'],['heat_stress','إجهاد حراري'],['maintenance','أثر صيانة مجدولة'],['healthy','لا توجد مشكلة'],['other','سبب آخر']];
+
+/* Plain-language information: city briefing (dashboard) and park story (area page). */
+function briefingCard(){const b=S.data?.briefing;if(!b)return '';
+ return `<div class="surface brief tone-box-${b.tone}"><div class="brief-head">${icon('sparkles',20)}<div><small>${ar()?'الملخص الذكي لحدائق جدة':'Smart briefing'}</small><h3>${esc(b.headline_ar)}</h3></div></div>
+ <ul class="brief-lines">${b.lines_ar.map(l=>`<li>${esc(l)}</li>`).join('')}</ul>
+ ${b.priorities?.length?`<div class="brief-pri"><b>${ar()?'ما يجب فعله هذا الأسبوع:':'This week:'}</b>${b.priorities.map((p,k)=>`<div class="brief-row"><span class="brief-n">${k+1}</span><div><b>${esc(p.name_ar)}</b> — ${esc(p.title_ar)}<small>${esc(p.action_ar)}${p.deadline_ar?` · ${ar()?'خلال':'within'} ${esc(p.deadline_ar)}`:''}</small></div>${btn(t('areaDetails'),'open-area',{id:p.id})}</div>`).join('')}</div>`:''}</div>`}
+function storyCard(a){const st=a?.insight?.story;if(!st)return '';
+ return `<div class="surface brief tone-box-${st.tone}"><div class="brief-head">${icon('message-square-text',20)}<div><small>${ar()?'الخلاصة بلغة بسيطة':'In plain words'}</small><h3>${esc(st.headline_ar)}</h3></div></div>
+ <div class="story">${st.story_ar.map(p=>`<p>${esc(p)}</p>`).join('')}</div>
+ <small class="muted">${ar()?'الأرقام والأدلة التفصيلية في بطاقات التحليل أسفل الصفحة.':'Details and evidence are in the cards below.'}</small></div>`}

@@ -15,6 +15,7 @@ import re
 from maintenance_engine import maintenance_engine, MONTHLY_MAINTENANCE, ndvi_drop_activities
 from plant_catalog import PLANTS, parse_species, species_summary, salt_tolerant
 import rawaa_ml
+import narrative
 import math
 import os
 import secrets
@@ -652,6 +653,7 @@ def attach_insights(areas):
                        'rules_accuracy':st.get('rules_accuracy'),'labels':st['labels'],'importances':st.get('importances',[])[:3]}
         else:
             ins['ml']={'trained':False,'labels':st['labels'],'min_labels':st['min_labels'],'reason_ar':st.get('reason_ar')}
+    for a in areas: a['insight']['story']=narrative.park_story(a)
     return areas
 
 def label_samples(peers=None):
@@ -757,7 +759,7 @@ def dashboard(req:Request):
         areas=attach_insights([full_area(db,r) for r in db.execute('SELECT a.* FROM areas a'+clause+' ORDER BY a.id',params)])
         tasks=[dict(r) for r in db.execute('SELECT t.*, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind=\'before\') AS has_before_photo, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind=\'after\') AS has_after_photo FROM tasks t JOIN areas a ON t.area_id=a.id'+clause+' ORDER BY t.created_at DESC',params)]
         alerts=[dict(r) for r in db.execute('SELECT al.* FROM alerts al JOIN areas a ON al.area_id=a.id'+clause+' ORDER BY al.created_at DESC',params)]
-    return {'areas':areas,'tasks':tasks,'alerts':alerts,
+    return {'areas':areas,'tasks':tasks,'alerts':alerts,'briefing':narrative.city_briefing(areas),
         'counts':{'total':len(areas),'stable':sum(a['metrics']['status']=='stable' for a in areas),
                   'monitor':sum(a['metrics']['status']=='monitor' for a in areas),
                   'high':sum(a['metrics']['status']=='high' for a in areas),
