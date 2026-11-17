@@ -36,6 +36,16 @@ DB_PATH = Path(os.environ.get('RAWAA_DB') or ROOT / 'data' / 'rawaa.sqlite3')
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title='Rawaa | رَوَاء API', version='0.1.0')
 app.mount('/static', StaticFiles(directory=str(ROOT / 'static')), name='static')
+
+@app.middleware('http')
+async def _revalidate_static(request, call_next):
+    """Make browsers re-check the page and its scripts on every visit (cheap ETag check),
+    so a new deployment shows up immediately instead of an old cached copy."""
+    response=await call_next(request)
+    path=request.url.path
+    if path=='/' or path.endswith(('.js','.css','.html')):
+        response.headers['Cache-Control']='no-cache'
+    return response
 DB_LOCK = threading.RLock()
 
 
