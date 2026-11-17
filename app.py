@@ -12,6 +12,8 @@ import hmac
 import io
 import json
 import re
+from maintenance_engine import maintenance_engine, MONTHLY_MAINTENANCE, ndvi_drop_activities
+from plant_catalog import PLANTS, parse_species, species_summary, salt_tolerant
 import math
 import os
 import secrets
@@ -40,9 +42,81 @@ DB_LOCK = threading.RLock()
 def utcnow():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
+# --- Database: SQLite locally (RAWAA_DB), PostgreSQL in production when DATABASE_URL is set (e.g. Neon). ---
+DATABASE_URL=os.getenv('DATABASE_URL','').strip()
+IS_PG=DATABASE_URL.startswith(('postgres://','postgresql://'))
+_TABLES_WITH_ID={'users','sessions','areas','observations','alerts','tasks','activity'}
+
+class _Row(dict):
+    """Row usable like sqlite3.Row: row['col'], row[0], dict(row)."""
+    __slots__=('_vals',)
+    def __init__(self,cols,vals):
+        super().__init__(zip(cols,vals));self._vals=list(vals)
+    def __getitem__(self,k):
+        return self._vals[k] if isinstance(k,int) else dict.__getitem__(self,k)
+    def keys(self): return list(dict.keys(self))
+
+class _PGCursor:
+    def __init__(self,cur,lastrowid=None):
+        self._c=cur;self.lastrowid=lastrowid
+        self._cols=[d.name for d in cur.description] if cur.description else []
+    def fetchone(self):
+        r=self._c.fetchone();return _Row(self._cols,r) if r is not None else None
+    def fetchall(self): return [_Row(self._cols,r) for r in self._c.fetchall()]
+    def __iter__(self): return iter(self.fetchall())
+
+class _PGConn:
+    """Thin adapter so the app's SQLite-style SQL ('?' placeholders, lastrowid) runs on PostgreSQL."""
+    def __init__(self,conn): self._conn=conn
+    def execute(self,sql,params=()):
+        q=sql.replace('%','%%').replace('?','%s')
+        m=re.match(r"\s*INSERT\s+INTO\s+(\w+)",q,re.I)
+        want_id=bool(m and m.group(1).lower() in _TABLES_WITH_ID and 'RETURNING' not in q.upper())
+        if want_id: q=q.rstrip().rstrip(';')+' RETURNING id'
+        cur=self._conn.cursor();cur.execute(q,tuple(params))
+        rid=None
+        if want_id:
+            r=cur.fetchone();rid=r[0] if r else None
+        return _PGCursor(cur,rid)
+    def executescript(self,script):
+        for stmt in [x.strip() for x in script.split(';') if x.strip()]:
+            self._conn.execute(_pg_ddl(stmt))
+    def commit(self): self._conn.commit()
+    def rollback(self): self._conn.rollback()
+
+def _pg_ddl(stmt):
+    stmt=re.sub(r'\bid INTEGER PRIMARY KEY\b','id SERIAL PRIMARY KEY',stmt)
+    return stmt.replace(' BLOB',' BYTEA')
+
+_PG_CONN=None
+def _pg():
+    global _PG_CONN
+    import psycopg
+    if _PG_CONN is not None and not _PG_CONN.closed:
+        try:
+            _PG_CONN.execute('SELECT 1');_PG_CONN.commit();return _PG_CONN
+        except Exception:
+            try:_PG_CONN.close()
+            except Exception:pass
+    _PG_CONN=psycopg.connect(DATABASE_URL,connect_timeout=15)
+    return _PG_CONN
+
+def table_columns(db,table):
+    if IS_PG:
+        return {r[0] for r in db.execute('SELECT column_name FROM information_schema.columns WHERE table_name=?',(table,))}
+    return {r[1] for r in db.execute(f'PRAGMA table_info({table})')}
+
 @contextmanager
 def connect():
     with DB_LOCK:
+        if IS_PG:
+            raw=_pg();db=_PGConn(raw)
+            try:
+                yield db
+                raw.commit()
+            except Exception:
+                raw.rollback();raise
+            return
         db = sqlite3.connect(DB_PATH, timeout=15)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA foreign_keys=ON')
@@ -224,9 +298,11 @@ purge_demo_areas()
 EXTRA_INDEX_COLUMNS = ('ndwi','savi','ndre','salinity','ndvi_std')
 def migrate_spectral_columns():
     with connect() as db:
-        have={r[1] for r in db.execute('PRAGMA table_info(observations)')}
+        have=table_columns(db,'observations')
         for col in EXTRA_INDEX_COLUMNS:
             if col not in have: db.execute(f'ALTER TABLE observations ADD COLUMN {col} REAL')
+        if 'data' not in table_columns(db,'task_photos'):
+            db.execute('ALTER TABLE task_photos ADD COLUMN data '+('BYTEA' if IS_PG else 'BLOB'))
 
 migrate_spectral_columns()
 
@@ -285,6 +361,201 @@ def metrics(area_id, db):
             'forecast':forecast,'forecast_kind':'illustrative_linear_trend',
             'latest_date':latest['measured_at'],'demo':bool(series[0]['is_demo']),
             'source':latest['source'],'observations':series}
+
+
+# =====================================================================================================
+# RAWAA intelligence engine: diagnosis -> forecast -> intervention recommendations.
+# Transparent, rule-based and statistical (no black box): every conclusion carries the numbers,
+# the reference it was compared with, and a plain-language explanation in Arabic and English.
+# =====================================================================================================
+COASTAL_SITES={'Middle Corniche Park','Validation site 2'}
+_FLOOR={'ndvi':0.02,'ndmi':0.02,'ndwi':0.02,'ndre':0.015,'salinity':0.005,'ndvi_std':0.01}
+_MONTHS_AR=['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر']
+
+def _fin(x): return isinstance(x,(int,float)) and math.isfinite(x)
+
+def _ref(rows,key):
+    vals=[r[key] for r in rows if _fin(r.get(key))]
+    if len(vals)<2: return None
+    med=statistics.median(vals);sd=statistics.pstdev(vals)
+    return {'median':med,'std':max(sd,_FLOOR[key]),'n':len(vals)}
+
+def _z(v,ref): return (v-ref['median'])/ref['std'] if (ref and _fin(v)) else None
+
+def _holt(y,alpha=0.5,beta=0.3,phi=0.85):
+    """Damped-trend Holt smoothing. Returns one-step in-sample predictions and final level/trend."""
+    level,trend=y[0],(y[1]-y[0]) if len(y)>1 else 0.0
+    preds=[None]
+    for t in range(1,len(y)):
+        p=level+phi*trend;preds.append(p)
+        new_level=alpha*y[t]+(1-alpha)*(level+phi*trend)
+        trend=beta*(new_level-level)+(1-beta)*phi*trend;level=new_level
+    return preds,level,trend
+
+def _forecast(series,base):
+    y=[r['ndvi'] for r in series]
+    if len(y)<5: return {'available':False,'reason_ar':'يلزم 5 قراءات شهرية صالحة على الأقل للتنبؤ.','reason_en':'At least 5 valid monthly readings are needed to forecast.'}
+    preds,level,trend=_holt(y,phi=0.85)
+    errs=[y[t]-preds[t] for t in range(2,len(y))]
+    sd=max(statistics.pstdev(errs) if len(errs)>1 else 0.03,0.01)
+    # honest back-test: model vs "same as last month" on the last 3 months
+    bt=range(max(2,len(y)-3),len(y))
+    mae_model=statistics.mean(abs(y[t]-preds[t]) for t in bt)
+    mae_naive=statistics.mean(abs(y[t]-y[t-1]) for t in bt)
+    last=date.fromisoformat(series[-1]['measured_at'])
+    out=[];phi=0.85
+    for h in (1,2,3):
+        damp=sum(phi**i for i in range(1,h+1))
+        v=max(-1,min(1,level+damp*trend));w=1.96*sd*math.sqrt(h)
+        d=last+timedelta(days=30*h)
+        out.append({'h':h,'date':d.isoformat(),'month_ar':_MONTHS_AR[d.month-1],'ndvi':round(v,3),'low':round(v-w,3),'high':round(v+w,3)})
+    threshold=base*0.85 if base and base>0 else None
+    risk=None
+    if threshold is not None:
+        zz=(threshold-out[-1]['ndvi'])/(sd*math.sqrt(3))
+        risk=round(100*0.5*(1+math.erf(zz/math.sqrt(2))))
+    slope=trend
+    direction='declining' if slope<-0.005 else 'improving' if slope>0.005 else 'stable'
+    dir_ar={'declining':'تراجع','improving':'تحسّن','stable':'استقرار'}[direction]
+    level_ar='مرتفع' if (risk or 0)>=60 else 'متوسط' if (risk or 0)>=30 else 'منخفض'
+    level_en='high' if (risk or 0)>=60 else 'medium' if (risk or 0)>=30 else 'low'
+    beats=mae_model<=mae_naive
+    return {'available':True,'method':'Holt damped trend (α=0.5, β=0.3, φ=0.85)','points':out,'trend_per_month':round(slope,4),
+      'direction':direction,'risk_pct':risk,'risk_level':level_en,'threshold':round(threshold,3) if threshold is not None else None,
+      'mae_model':round(mae_model,3),'mae_naive':round(mae_naive,3),'beats_naive':beats,'residual_sd':round(sd,3),
+      'explain_ar':(f"الاتجاه الحالي لمؤشر NDVI هو {dir_ar} بمعدل {slope:+.3f} شهريًا. نتوقع بعد 3 أشهر ({out[-1]['month_ar']}) قيمة {out[-1]['ndvi']:.2f} "
+                    f"ضمن نطاق {out[-1]['low']:.2f}–{out[-1]['high']:.2f} (ثقة 95%). احتمال أن ينخفض المؤشر تحت حد الإنذار ({threshold:.2f} = 85% من خط الأساس) "
+                    f"هو {risk}% أي خطر {level_ar}. " if threshold is not None else f"الاتجاه الحالي {dir_ar}. ")+
+                   (f"في اختبار آخر 3 أشهر كان متوسط خطأ النموذج {mae_model:.3f} مقابل {mae_naive:.3f} لطريقة «نفس قيمة الشهر السابق»، "
+                    +("فالنموذج أدق من الطريقة البسيطة." if beats else "أي أن النموذج لم يتفوّق بعد على الطريقة البسيطة؛ تعامل مع التنبؤ كمؤشر اتجاه فقط.")),
+      'explain_en':(f"NDVI is currently {direction} at {slope:+.3f} per month. In 3 months ({out[-1]['date'][:7]}) we expect {out[-1]['ndvi']:.2f} "
+                    f"(95% range {out[-1]['low']:.2f}–{out[-1]['high']:.2f}). Probability of falling below the alert line ({threshold:.2f} = 85% of baseline): {risk}% ({level_en} risk). " if threshold is not None else f"Trend: {direction}. ")+
+                   f"Back-test on the last 3 months: model error {mae_model:.3f} vs {mae_naive:.3f} for 'same as last month'"+(" — the model is more accurate." if beats else " — the model does not yet beat the simple method; treat it as a trend indicator only.")}
+
+# Recommendations now come from maintenance_engine.py (team notebook), see build_insight().
+_DX={'insufficient':('بيانات غير كافية للتشخيص','Not enough data to diagnose'),'healthy':('حالة سليمة ومستقرة','Healthy and stable'),
+ 'improving':('تحسّن في الغطاء النباتي','Vegetation improving'),'water_stress':('إجهاد مائي محتمل (نقص ري)','Probable water stress (under-irrigation)'),
+ 'waterlogging':('تشبّع مائي أو تسرّب محتمل','Probable waterlogging or leak'),'salinity':('إجهاد ملحي محتمل','Probable salinity stress'),
+ 'nutrition':('نقص تغذية/كلوروفيل محتمل','Probable nutrient / chlorophyll deficiency'),'patchy_damage':('تلف موضعي في أجزاء من الحديقة','Localised damage in parts of the park'),
+ 'maintenance':('انخفاض متوقّع بسبب صيانة مجدولة','Expected dip from scheduled maintenance'),'unexplained':('تراجع غير مفسَّر يحتاج تحققًا ميدانيًا','Unexplained decline needing a field check')}
+
+def build_insight(area,peers=None):
+    m=area['metrics'];obs=[r for r in m['observations'] if _fin(r.get('ndvi')) and (r.get('valid_pixels_pct') or 0)>=60]
+    name=area.get('name_en','')
+    res={'version':1,'generated_at':utcnow()}
+    if len(obs)<3:
+        res.update(diagnosis='insufficient',title_ar=_DX['insufficient'][0],title_en=_DX['insufficient'][1],confidence='low',evidence=[],alternatives=[],
+          summary_ar='لا توجد 3 قراءات شهرية صالحة بعد. اضغطوا «جلب قراءات فضائية» لبدء التشخيص.',summary_en='Fewer than 3 valid monthly readings. Sync satellite readings to start.',
+          forecast={'available':False,'reason_ar':'لا توجد قراءات كافية.','reason_en':'Not enough readings.'},recommendations=[],data_quality={'n':len(obs)},risk_score=0,
+          maintenance_plan=maintenance_engine(tree_type=area.get('plants') or None,diagnosis='insufficient',confidence='Low',month=datetime.now(timezone.utc).month).to_dict())
+        return res
+    hist=obs[:-2] if len(obs)>=4 else obs[:-1];latest=obs[-1];prev=obs[-2]
+    refs={k:_ref(hist,k) for k in _FLOOR}
+    z={k:_z(latest.get(k),refs[k]) for k in _FLOOR}
+    base=m['baseline'] if _fin(m.get('baseline')) else refs['ndvi']['median']
+    chg=m['change_pct'] if _fin(m.get('change_pct')) else ((latest['ndvi']-base)/abs(base)*100 if base else 0)
+    month=int(latest['measured_at'][5:7]);prev_month=int(prev['measured_at'][5:7])
+    maint=bool(ndvi_drop_activities(month,area.get('plants') or None) or ndvi_drop_activities(prev_month,area.get('plants') or None))
+    lowveg=base is not None and base<0.15
+    coastal=name in COASTAL_SITES
+    # peer percentile of salinity index (city context)
+    sal_pct=None
+    if peers and _fin(latest.get('salinity')):
+        vals=[p for p in peers if _fin(p)]
+        if len(vals)>=3: sal_pct=round(100*sum(v<=latest['salinity'] for v in vals)/len(vals))
+    ev=[]
+    def add(key,label_ar,label_en,value,ref,verdict,why_ar,why_en):
+        ev.append({'key':key,'label_ar':label_ar,'label_en':label_en,'value':None if value is None else round(value,3),'reference':ref,'verdict':verdict,'why_ar':why_ar,'why_en':why_en})
+    decline=chg<=-10;strong=chg<=-20
+    add('ndvi','NDVI (كثافة وصحة الغطاء)','NDVI (vegetation vigour)',latest['ndvi'],f"خط الأساس {base:.3f} · التغير {chg:+.1f}%",'bad' if decline else 'good' if chg>=10 else 'ok',
+        f"NDVI الحالي {latest['ndvi']:.3f} مقابل خط أساس الحديقة {base:.3f} (وسيط قراءاتها السابقة)، أي تغير {chg:+.1f}%. "+("انخفاض 10% أو أكثر يُعدّ إشارة تستحق التفسير." if decline else "التغير ضمن النطاق الطبيعي (أقل من 10%)." if chg>-10 and chg<10 else "ارتفاع واضح."),
+        f"NDVI {latest['ndvi']:.3f} vs this park’s baseline {base:.3f} (median of its past readings): {chg:+.1f}%. "+("A drop of 10%+ is a signal to explain." if decline else "Within normal range."))
+    def zline(k,la,le,meaning_ar,meaning_en):
+        if z[k] is None or not _fin(latest.get(k)): return None
+        r=refs[k];zz=z[k]
+        verdict='bad' if (zz<=-1 if k in ('ndmi','ndre') else zz>=1) else 'ok'
+        add(k,la,le,latest[k],f"المعتاد {r['median']:.3f} ± {r['std']:.3f} · الانحراف {zz:+.1f}σ",verdict,
+            f"{meaning_ar} القيمة الآن {latest[k]:.3f} والمعتاد لهذه الحديقة {r['median']:.3f}؛ أي {abs(zz):.1f} انحراف معياري {'تحت' if zz<0 else 'فوق'} المعتاد. "+("هذا انحراف ملحوظ (1σ أو أكثر)." if abs(zz)>=1 else "ضمن المعتاد."),
+            f"{meaning_en} Now {latest[k]:.3f}; usual for this park {r['median']:.3f}: {zz:+.1f}σ. "+("Notable deviation (≥1σ)." if abs(zz)>=1 else "Within normal."))
+        return zz
+    zw=zline('ndmi','NDMI (رطوبة النبات)','NDMI (plant moisture)','NDMI يقيس الماء داخل أوراق النبات؛ انخفاضه يعني عطشًا.','NDMI measures leaf water; a drop means thirst.')
+    zl=zline('ndwi','NDWI (الماء السطحي)','NDWI (surface water)','NDWI يرتفع مع الماء المكشوف أو التربة المشبعة.','NDWI rises with open water or saturated soil.')
+    zc=zline('ndre','NDRE (الكلوروفيل)','NDRE (chlorophyll)','NDRE يعكس الكلوروفيل والتغذية؛ انخفاضه مع رطوبة طبيعية يشير لنقص تغذية.','NDRE reflects chlorophyll/nutrition.')
+    zs=zline('salinity','SI (مؤشر الملوحة التقريبي)','SI (approx. salinity)','SI مؤشر سطوع يرتفع مع القشور الملحية والتربة المكشوفة، وهو تقريبي.','SI is a brightness index that rises with salt crusts and bare soil; approximate.')
+    zp=zline('ndvi_std','تباين NDVI داخل الحديقة','Within-park NDVI variability','ارتفاع التباين يعني أن أجزاء من الحديقة تتدهور بينما أخرى سليمة.','Higher variability means some parts decline while others stay healthy.')
+    scores={}
+    if decline:
+        if zw is not None and zw<=-1: scores['water_stress']=2+(1 if strong else 0)+(1 if zw<=-1.5 else 0)
+        if zl is not None and zl>=1 and (zw is None or zw>-0.5): scores['waterlogging']=2+(1 if zl>=1.5 else 0)
+        if zs is not None and (zs>=1 or (coastal and (sal_pct or 0)>=75)): scores['salinity']=1.5+(1 if coastal else 0)+(0.5 if zs>=1.5 else 0)
+        if zc is not None and zc<=-1 and (zw is None or zw>-0.5): scores['nutrition']=2
+        if zp is not None and zp>=1: scores['patchy_damage']=2+(0.5 if zp>=1.5 else 0)
+        if maint: scores['maintenance']=1.5 if not strong else 0.8
+        if not scores: scores['unexplained']=1
+        dx=max(scores,key=scores.get)
+    else:
+        dx='improving' if chg>=10 else 'healthy'
+        if zp is not None and zp>=1.5 and chg<=-5: dx='patchy_damage';scores[dx]=1.5
+    agree=sum(1 for e in ev if e['verdict']=='bad')
+    q_valid=latest.get('valid_pixels_pct') or 0
+    conf_pts=(2 if agree>=3 else 1 if agree==2 else 0)+(1 if len(obs)>=8 else 0)-(1 if q_valid<70 else 0)-(1 if lowveg else 0)-(1 if dx in ('salinity','unexplained') else 0)
+    if dx in ('healthy','improving'): conf_pts+=2
+    confidence='high' if conf_pts>=3 else 'medium' if conf_pts>=2 else 'low'
+    conf_ar={'high':'مرتفعة','medium':'متوسطة','low':'منخفضة'}[confidence]
+    fc=_forecast(obs,base)
+    alts=[{'key':k,'title_ar':_DX[k][0],'title_en':_DX[k][1],'score':round(v,1)} for k,v in sorted(scores.items(),key=lambda x:-x[1]) if k!=dx]
+    notes_ar=[];notes_en=[]
+    if lowveg: notes_ar.append('الغطاء النباتي في هذه الحديقة منخفض أصلًا (NDVI < 0.15)، أي أن جزءًا كبيرًا منها ممرات أو تربة؛ لذلك تتضخّم النسب المئوية للتغير.');notes_en.append('Low vegetation cover (NDVI < 0.15): percentage changes are amplified.')
+    if maint and dx!='maintenance': notes_ar.append(f"شهر القراءة ({_MONTHS_AR[month-1]}) أو الذي قبله فيه صيانة مجدولة قد تخفض المؤشر مؤقتًا، وأُخذ ذلك في الحسبان.");notes_en.append('Scheduled maintenance this or last month can lower NDVI briefly; taken into account.')
+    if coastal: notes_ar.append('موقع ساحلي: رذاذ البحر والملوحة عاملان محتملان.');notes_en.append('Coastal site: sea spray and salinity are plausible factors.')
+    if q_valid<80: notes_ar.append(f"نسبة البكسلات الصافية في آخر قراءة {q_valid:.0f}% (أقل من 80%)، فالدقة أقل.");notes_en.append(f"Clear-sky share in the last reading was {q_valid:.0f}% (<80%): lower precision.")
+    title_ar,title_en=_DX[dx]
+    top=[e for e in ev if e['verdict']=='bad'][:3]
+    summary_ar=f"التشخيص: {title_ar} (ثقة {conf_ar}). "+(("الأدلة: "+"؛ ".join(f"{e['label_ar'].split(' (')[0]} {e['value']}" for e in top)+". ") if top else "")+ \
+               ("الأرقام كلها ضمن المعتاد لهذه الحديقة." if dx in ('healthy',) else "")
+    summary_en=f"Diagnosis: {title_en} ({confidence} confidence)."
+    # Species from the approved plant list sharpen the interpretation and the plan.
+    species=parse_species(area.get('plants'));sp_sum=species_summary(species)
+    if sp_sum:
+        if dx=='water_stress' and sp_sum['thirsty_ar']:
+            notes_ar.append('أنواع عالية الاحتياج للري في هذه الحديقة وهي الأكثر تأثرًا بنقص الري: '+'، '.join(sp_sum['thirsty_ar'])+'.');notes_en.append('High-water species here are most sensitive to under-irrigation.')
+        if dx=='water_stress' and sp_sum['avg_irrigation']<=1.5:
+            notes_ar.append('معظم نباتات هذه الحديقة قليلة الاحتياج للري، فالإجهاد المائي أقل احتمالًا؛ تحقّقوا من أسباب أخرى أيضًا.');notes_en.append('Mostly low-water species: water stress is less likely; check other causes.')
+        if dx=='waterlogging' and sp_sum['avg_irrigation']<=1.5:
+            notes_ar.append('نباتات الحديقة قليلة الاحتياج للري؛ الري الزائد يضرها أكثر من غيرها.');notes_en.append('Low-water species are harmed most by over-watering.')
+    # Maintenance Engine (team notebook) turns the diagnosis into a maintenance plan.
+    now_month=datetime.now(timezone.utc).month
+    plan=maintenance_engine(tree_type=area.get('plants') or None,diagnosis=dx,confidence=confidence.capitalize(),month=now_month).to_dict()
+    pri={'High':'high','Medium':'medium','Low':'low'}.get(plan['priority'],'medium')
+    recs=[{'order':i+1,'action_ar':a_ar,'action_en':a_en,'priority':pri,'timeframe_ar':plan['deadline_ar'],'timeframe_en':plan['deadline'],
+           'owner_ar':plan['owner_ar'],'owner_en':plan['owner']} for i,(a_ar,a_en) in enumerate(zip(plan['ai_recommendations_ar'],plan['ai_recommendations']))]
+    if fc.get('available') and (fc.get('risk_pct') or 0)>=60 and dx in ('healthy','improving','maintenance'):
+        recs.append({'order':len(recs)+1,'action_ar':f"التنبؤ يشير لخطر {fc['risk_pct']}% بتراجع المؤشر تحت حد الإنذار خلال 3 أشهر: جدولة فحص وقائي للري قبل {fc['points'][0]['month_ar']}.",
+                     'action_en':f"Forecast gives {fc['risk_pct']}% risk of falling below the alert line within 3 months: schedule a preventive irrigation check before {fc['points'][0]['date'][:7]}.",
+                     'priority':'medium','timeframe_ar':'شهر','timeframe_en':'1 month','owner_ar':'الجهة الرقابية','owner_en':'Regulator'})
+    if dx=='salinity' or (coastal and dx in ('water_stress','patchy_damage','unexplained')):
+        names=[f"{p['name_ar']} ({p['scientific']})" for p in salt_tolerant()]
+        recs.append({'order':len(recs)+1,'action_ar':'عند الاستبدال: اختيار أنواع مناسبة للمواقع الساحلية والمالحة من القائمة المعتمدة: '+'، '.join(names)+'.',
+                     'action_en':'At replacement, choose coastal/saline-suited species from the approved list: '+', '.join(p['scientific'] for p in salt_tolerant())+'.',
+                     'priority':'low','timeframe_ar':'عند الاستبدال','timeframe_en':'at replacement','owner_ar':'الجهة الرقابية','owner_en':'Regulator'})
+    v_ar,v_en=plan['success_indicator_ar'],plan['success_indicator']
+    sev={'water_stress':3,'waterlogging':3,'patchy_damage':3,'salinity':2,'nutrition':2,'unexplained':3,'maintenance':1,'healthy':0,'improving':0}.get(dx,0)
+    risk_score=min(100,round(sev*18+max(0,-chg)*0.8+((fc.get('risk_pct') or 0)*0.25 if fc.get('available') else 0)))
+    res.update(diagnosis=dx,title_ar=title_ar,title_en=title_en,confidence=confidence,confidence_ar=conf_ar,evidence=ev,alternatives=alts,
+      notes_ar=notes_ar,notes_en=notes_en,summary_ar=summary_ar,summary_en=summary_en,forecast=fc,recommendations=recs,verify_ar=v_ar,verify_en=v_en,
+      maintenance_plan=plan,species=[{k:p[k] for k in ('name_ar','scientific','category_ar','irrigation_ar','irrigation_en','coastal')} for p in species],species_summary=sp_sum,risk_score=risk_score,latest_date=latest['measured_at'],baseline=round(base,3) if base is not None else None,change_pct=round(chg,1),
+      data_quality={'n':len(obs),'latest_valid_pct':round(q_valid,1),'history_window':f"{hist[0]['measured_at'][:7]} → {hist[-1]['measured_at'][:7]}" if hist else None,'salinity_city_percentile':sal_pct},
+      method_ar='يقارن التشخيص آخر قراءة بالسجل الخاص بالحديقة نفسها (الوسيط والانحراف المعياري لقراءاتها السابقة) لا بقيمة ثابتة، لأن كل حديقة تختلف في نوع نباتاتها وكثافتها. '
+                'نعتبر الانحراف ملحوظًا إذا تجاوز 1σ، والتراجع إشارة إذا بلغ 10% من خط الأساس. تُرجَّح الأسباب حسب عدد الأدلة المتوافقة، ويُخصم من الثقة عند قلة القراءات أو الغيوم أو ضعف الغطاء النباتي. '
+                'هذه قواعد شفافة قابلة للتدقيق وليست نموذجًا مدرَّبًا؛ التشخيص يحتاج تأكيدًا ميدانيًا.',
+      method_en='Each reading is compared with the park’s own history (median and standard deviation), not fixed thresholds. Deviations ≥1σ are notable; a 10% drop vs baseline is a signal. '
+                'Causes are ranked by agreeing evidence; confidence is reduced for few readings, clouds or sparse vegetation. Transparent rules, not a trained model; field confirmation required.')
+    return res
+
+def attach_insights(areas):
+    peers=[(a['metrics']['observations'] or [{}])[-1].get('salinity') for a in areas if a['metrics']['observations']]
+    for a in areas: a['insight']=build_insight(a,peers)
+    return areas
 
 
 def full_area(db,r):
@@ -360,8 +631,8 @@ def dashboard(req:Request):
     u=current_user(req)
     clause,params=in_scope_clause(u)
     with connect() as db:
-        areas=[full_area(db,r) for r in db.execute('SELECT a.* FROM areas a'+clause+' ORDER BY a.id',params)]
-        tasks=[dict(r) for r in db.execute('SELECT t.*, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind="before") AS has_before_photo, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind="after") AS has_after_photo FROM tasks t JOIN areas a ON t.area_id=a.id'+clause+' ORDER BY t.created_at DESC',params)]
+        areas=attach_insights([full_area(db,r) for r in db.execute('SELECT a.* FROM areas a'+clause+' ORDER BY a.id',params)])
+        tasks=[dict(r) for r in db.execute('SELECT t.*, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind=\'before\') AS has_before_photo, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind=\'after\') AS has_after_photo FROM tasks t JOIN areas a ON t.area_id=a.id'+clause+' ORDER BY t.created_at DESC',params)]
         alerts=[dict(r) for r in db.execute('SELECT al.* FROM alerts al JOIN areas a ON al.area_id=a.id'+clause+' ORDER BY al.created_at DESC',params)]
     return {'areas':areas,'tasks':tasks,'alerts':alerts,
         'counts':{'total':len(areas),'stable':sum(a['metrics']['status']=='stable' for a in areas),
@@ -378,7 +649,7 @@ def dashboard(req:Request):
 def areas_list(req:Request):
     u=current_user(req);clause,params=in_scope_clause(u)
     with connect() as db:
-        return [full_area(db,r) for r in db.execute('SELECT a.* FROM areas a'+clause+' ORDER BY a.id',params)]
+        return attach_insights([full_area(db,r) for r in db.execute('SELECT a.* FROM areas a'+clause+' ORDER BY a.id',params)])
 
 class AreaCreate(BaseModel):
     name_ar:str=Field(min_length=2,max_length=120)
@@ -406,17 +677,48 @@ def validate_geometry(g):
 def add_area(v:AreaCreate,req:Request):
     u=current_user(req);require_regulator(u);validate_geometry(v.geometry)
     with connect() as db:
-        assigned=db.execute('SELECT id FROM users WHERE id=? AND role="operator"',(v.assigned_operator,)).fetchone()
+        assigned=db.execute('SELECT id FROM users WHERE id=? AND role=\'operator\'',(v.assigned_operator,)).fetchone()
         if not assigned: raise HTTPException(400,'Operator not found')
         c=db.execute('''INSERT INTO areas(name_ar,name_en,geometry,irrigation,plants,planting_date,assigned_operator,demo,created_at)
             VALUES(?,?,?,?,?,?,?,?,?)''',(v.name_ar,v.name_en,json.dumps(v.geometry),v.irrigation,v.plants,v.planting_date,v.assigned_operator,0,utcnow()))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',(u['id'],'create_area',str(c.lastrowid),v.name_en,utcnow()))
         return full_area(db,db.execute('SELECT * FROM areas WHERE id=?',(c.lastrowid,)).fetchone())
 
+@app.get('/api/plants')
+def plants_catalog(req:Request):
+    """Approved plant list (category, names, use, indicative irrigation)."""
+    current_user(req);return PLANTS
+
+class PlantsUpdate(BaseModel):
+    plants:list[str]=Field(default_factory=list,max_length=60)
+
+@app.patch('/api/areas/{area_id}/plants')
+def set_area_plants(area_id:int,v:PlantsUpdate,req:Request):
+    u=current_user(req);require_regulator(u)
+    known={p['scientific'] for p in PLANTS}
+    bad=[x for x in v.plants if x not in known]
+    if bad: raise HTTPException(400,'Unknown species: '+', '.join(bad[:5]))
+    with connect() as db:
+        area_access(db,u,area_id)
+        db.execute('UPDATE areas SET plants=? WHERE id=?',(', '.join(v.plants),area_id))
+        db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',(u['id'],'set_plants',str(area_id),f'{len(v.plants)} species',utcnow()))
+    return {'ok':True,'count':len(v.plants)}
+
+@app.get('/api/maintenance-plan')
+def maintenance_plan_api(req:Request,diagnosis:str,confidence:str='Medium',tree_type:str='',month:int=0):
+    """Run the Maintenance Engine directly (same inputs as the team notebook)."""
+    current_user(req)
+    if month and not 1<=month<=12: raise HTTPException(400,'month must be 1-12')
+    return maintenance_engine(tree_type=tree_type or None,diagnosis=diagnosis,confidence=confidence,month=month or None).to_dict()
+
 @app.get('/api/areas/{area_id}')
 def get_area(area_id:int,req:Request):
     u=current_user(req)
-    with connect() as db: return full_area(db,area_access(db,u,area_id))
+    with connect() as db:
+        target=area_access(db,u,area_id)
+        allareas=[full_area(db,r) for r in db.execute('SELECT * FROM areas ORDER BY id')]
+    attach_insights(allareas)
+    return next(a for a in allareas if a['id']==target['id'])
 
 class CSVImport(BaseModel):
     csv_text:str=Field(min_length=10,max_length=1_000_000)
@@ -471,12 +773,19 @@ def assign_alert(alert_id:int,v:AssignAlert,req:Request):
             JOIN areas ar ON ar.id=al.area_id WHERE al.id=?''',(alert_id,)).fetchone()
         if not a: raise HTTPException(404,'Alert not found')
         if not a['assigned_operator']: raise HTTPException(400,'No operator assigned to this area')
-        dup=db.execute('SELECT id FROM tasks WHERE alert_id=? AND status!="closed"',(alert_id,)).fetchone()
+        dup=db.execute('SELECT id FROM tasks WHERE alert_id=? AND status<>\'closed\'',(alert_id,)).fetchone()
         if dup: raise HTTPException(409,'Active task already exists for this alert')
-        c=db.execute('''INSERT INTO tasks(area_id,alert_id,title_ar,title_en,assigned_to,status,priority,due_at,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)''',(a['area_id'],alert_id,'تحقق وصيانة','Inspection & maintenance',
-             a['assigned_operator'],'open',v.priority,v.due_at,utcnow(),utcnow()))
-        db.execute('UPDATE alerts SET status="assigned" WHERE id=?',(alert_id,))
+        allareas=attach_insights([full_area(db,r) for r in db.execute('SELECT * FROM areas ORDER BY id')])
+        ins=next((x['insight'] for x in allareas if x['id']==a['area_id']),None)
+        recs=(ins or {}).get('recommendations') or []
+        notes='\n'.join(f"{r['order']}. {r['action_ar']} ({r['timeframe_ar']})" for r in recs)
+        if ins and ins.get('verify_ar'): notes+='\nالتحقق من النجاح: '+ins['verify_ar']
+        title_ar='تحقق وصيانة — '+ins['title_ar'] if ins and ins['diagnosis'] not in ('insufficient','healthy','improving') else 'تحقق وصيانة'
+        title_en='Inspection & maintenance — '+ins['title_en'] if ins and ins['diagnosis'] not in ('insufficient','healthy','improving') else 'Inspection & maintenance'
+        c=db.execute('''INSERT INTO tasks(area_id,alert_id,title_ar,title_en,assigned_to,status,priority,due_at,notes,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(a['area_id'],alert_id,title_ar,title_en,
+             a['assigned_operator'],'open',v.priority,v.due_at,notes,utcnow(),utcnow()))
+        db.execute('UPDATE alerts SET status=\'assigned\' WHERE id=?',(alert_id,))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
                    (u['id'],'assign_task',str(c.lastrowid),f'alert {alert_id}',utcnow()))
     return {'id':c.lastrowid}
@@ -486,8 +795,8 @@ def list_tasks(req:Request):
     u=current_user(req)
     with connect() as db:
         if u['role']=='operator':
-            rows=db.execute('SELECT t.*, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind="before") AS has_before_photo, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind="after") AS has_after_photo FROM tasks t WHERE assigned_to=? ORDER BY id DESC',(u['id'],))
-        else: rows=db.execute('SELECT t.*, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind="before") AS has_before_photo, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind="after") AS has_after_photo FROM tasks t ORDER BY id DESC')
+            rows=db.execute('SELECT t.*, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind=\'before\') AS has_before_photo, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind=\'after\') AS has_after_photo FROM tasks t WHERE assigned_to=? ORDER BY id DESC',(u['id'],))
+        else: rows=db.execute('SELECT t.*, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind=\'before\') AS has_before_photo, EXISTS(SELECT 1 FROM task_photos p WHERE p.task_id=t.id AND p.kind=\'after\') AS has_after_photo FROM tasks t ORDER BY id DESC')
         return [dict(r) for r in rows]
 
 class TaskPatch(BaseModel):
@@ -518,7 +827,7 @@ def patch_task(task_id:int,v:TaskPatch,req:Request):
         sql='UPDATE tasks SET '+', '.join(f'{k}=?' for k in fields)+' WHERE id=?'
         db.execute(sql,[*fields.values(),task_id])
         if v.status=='closed' and t['alert_id']:
-            db.execute('UPDATE alerts SET status="closed" WHERE id=?',(t['alert_id'],))
+            db.execute('UPDATE alerts SET status=\'closed\' WHERE id=?',(t['alert_id'],))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
                    (u['id'],'update_task',str(task_id),json.dumps(fields,ensure_ascii=False),utcnow()))
         return asdict(db.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone())
@@ -847,15 +1156,17 @@ def scan_area(area_id:int,req:Request):
     with connect() as db:
         a=area_access(db,u,area_id)
         result=metrics(area_id,db)
-        if result['status'] not in ('high','monitor'):
+        allareas=attach_insights([full_area(db,r) for r in db.execute('SELECT * FROM areas ORDER BY id')])
+        ins=next(x for x in allareas if x['id']==area_id)['insight']
+        if result['status'] not in ('high','monitor') and ins['diagnosis'] in ('healthy','improving','insufficient','maintenance'):
             raise HTTPException(409,'No provisional alert threshold currently met')
-        existing=db.execute('SELECT id FROM alerts WHERE area_id=? AND status!="closed"',(area_id,)).fetchone()
+        existing=db.execute('SELECT id FROM alerts WHERE area_id=? AND status<>\'closed\'',(area_id,)).fetchone()
         if existing:
             raise HTTPException(409,'An active alert already exists for this area')
         cur=db.execute('''INSERT INTO alerts(area_id,severity,reason_ar,reason_en,status,created_at)
-            VALUES(?,?,?,?,?,?)''',(area_id,result['status'],
-              'انخفاض في مؤشر الغطاء النباتي (تصنيف تجريبي)',
-              'Vegetation index decline (provisional classification)','new',utcnow()))
+            VALUES(?,?,?,?,?,?)''',(area_id,result['status'] if result['status'] in ('high','monitor') else 'monitor',
+              f"{ins['title_ar']} — ثقة {ins.get('confidence_ar','')} · NDVI {ins.get('change_pct')}% مقابل خط الأساس",
+              f"{ins['title_en']} — {ins['confidence']} confidence · NDVI {ins.get('change_pct')}% vs baseline",'new',utcnow()))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES (?,?,?,?,?)',
             (u['id'],'scan',str(area_id),f'alert {cur.lastrowid} — {result["status"]}',utcnow()))
         return {'alert_id':cur.lastrowid,'status':result['status'],'message':'Provisional alert created; field verification required'}
@@ -900,10 +1211,10 @@ def upload_photo(task_id:int,v:PhotoUpload,req:Request):
     (photos_dir / file_name).write_bytes(raw)
     with connect() as db:
         old=db.execute('SELECT filename FROM task_photos WHERE task_id=? AND kind=?',(task_id,v.kind)).fetchone()
-        db.execute('''INSERT INTO task_photos(task_id,kind,filename,mime,uploaded_by,created_at)
-              VALUES(?,?,?,?,?,?) ON CONFLICT(task_id,kind) DO UPDATE SET
-              filename=excluded.filename,mime=excluded.mime,uploaded_by=excluded.uploaded_by,created_at=excluded.created_at''',
-              (task_id,v.kind,file_name,mime,u['id'],utcnow()))
+        db.execute('''INSERT INTO task_photos(task_id,kind,filename,mime,uploaded_by,created_at,data)
+              VALUES(?,?,?,?,?,?,?) ON CONFLICT(task_id,kind) DO UPDATE SET
+              filename=excluded.filename,mime=excluded.mime,uploaded_by=excluded.uploaded_by,created_at=excluded.created_at,data=excluded.data''',
+              (task_id,v.kind,file_name,mime,u['id'],utcnow(),raw))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
                    (u['id'],'task_photo',str(task_id),v.kind,utcnow()))
     if old:
@@ -917,8 +1228,9 @@ def get_photo(task_id:int,kind:str,req:Request):
     if kind not in ('before','after'): raise HTTPException(404,'Photo kind not found')
     with connect() as db:
         checked_task(db,u,task_id)
-        r=db.execute('SELECT filename,mime FROM task_photos WHERE task_id=? AND kind=?',(task_id,kind)).fetchone()
+        r=db.execute('SELECT filename,mime,data FROM task_photos WHERE task_id=? AND kind=?',(task_id,kind)).fetchone()
     if not r: raise HTTPException(404,'Photo not found')
+    if r['data']: return Response(bytes(r['data']),media_type=r['mime'])
     path=ROOT / 'media' / r['filename']
     if not path.is_file(): raise HTTPException(404,'Photo file missing')
     return FileResponse(path,media_type=r['mime'])
