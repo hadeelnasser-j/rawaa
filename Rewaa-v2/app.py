@@ -1244,12 +1244,24 @@ def _fetch_copernicus_token():
                     {'grant_type':'client_credentials','client_id':ident,'client_secret':secret},
                     {'Content-Type':'application/x-www-form-urlencoded'})['access_token']
 
+# At most a few Process API calls at once: a map can ask for dozens of images together, and unbounded
+# parallel calls exhaust the worker threads and freeze the whole site.
+_CDSE_SLOTS=threading.BoundedSemaphore(int(os.getenv('RAWAA_CDSE_CONCURRENCY','3')))
+
 def _process_image(payload, token):
+    if not _CDSE_SLOTS.acquire(timeout=25):
+        raise RuntimeError('Copernicus imagery busy; retry shortly')
+    try:
+        return _process_image_call(payload, token)
+    finally:
+        _CDSE_SLOTS.release()
+
+def _process_image_call(payload, token):
     req=request.Request('https://sh.dataspace.copernicus.eu/process/v1',
       data=json.dumps(payload).encode(),
       headers={'Content-Type':'application/json','Authorization':'Bearer '+token},method='POST')
     try:
-        with request.urlopen(req,timeout=80) as r:
+        with request.urlopen(req,timeout=45) as r:
             b=r.read(2_100_000)
             if not r.headers.get('Content-Type','').startswith('image/png') or len(b)>2_000_000:
                 raise RuntimeError('Unexpected imagery response')
@@ -1347,6 +1359,47 @@ def sentinel_tile(layer:str,z:int,x:int,y:int,req:Request,month:str='',cc:int=30
              'data':[{'type':'sentinel-2-l2a','dataFilter':{'timeRange':{'from':period.isoformat()+'T00:00:00Z','to':end.isoformat()+'T23:59:59Z'},
                       'mosaickingOrder':'leastCC','maxCloudCoverage':cc}}]},
              'output':{'width':256,'height':256,'responses':[{'identifier':'default','format':{'type':'image/png'}}]},
+             'evalscript':MAP_SCRIPTS[layer]}
+    try:
+        data=_process_image(payload,_copernicus_access_token())
+    except RuntimeError as ex:
+        raise HTTPException(502,str(ex)[:300]) from ex
+    try:
+        path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+    except OSError:
+        pass
+    return Response(data,media_type='image/png',headers=hdr)
+
+OVERLAY_DIR=Path(os.getenv('RAWAA_OVERLAY_CACHE','/tmp/rawaa-overlays'))
+
+@app.get('/api/areas/{area_id}/overlay/{layer}.png')
+def park_overlay(area_id:int,layer:str,req:Request,month:str=''):
+    """One coloured Sentinel-2 image per park, clipped to its polygon (transparent outside), cached on disk.
+    The map draws it over each park; far lighter than tiling the whole city."""
+    u=current_user(req)
+    if layer not in MAP_SCRIPTS: raise HTTPException(404,'Unknown layer')
+    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',month or ''): raise HTTPException(400,'month=YYYY-MM required')
+    period=date.fromisoformat(month+'-01')
+    if period>date.today().replace(day=1) or period.year<2017: raise HTTPException(400,'Month out of range')
+    with connect() as db:
+        a=area_access(db,u,area_id); geom=json.loads(a['geometry'])
+    validate_geometry(geom)
+    xs=[float(p[0]) for ring in geom['coordinates'] for p in ring]; ys=[float(p[1]) for ring in geom['coordinates'] for p in ring]
+    bbox=[min(xs),min(ys),max(xs),max(ys)]
+    if bbox[2]-bbox[0]>0.12 or bbox[3]-bbox[1]>0.12: raise HTTPException(422,'Area too large for an overlay')
+    gkey=hashlib.sha1(json.dumps(geom,sort_keys=True).encode()).hexdigest()[:12]
+    path=OVERLAY_DIR/str(area_id)/layer/month/f'{gkey}.png'
+    hdr={'Cache-Control':'private, max-age=86400','X-Rawaa-Bounds':','.join(f'{v:.6f}' for v in bbox)}
+    if path.exists(): return Response(path.read_bytes(),media_type='image/png',headers=hdr)
+    # ~10 m per pixel, capped at 512 px on the long side
+    wm=(bbox[2]-bbox[0])*111320*math.cos(math.radians((bbox[1]+bbox[3])/2)); hm=(bbox[3]-bbox[1])*110540
+    k=min(1.0,512/max(wm/10,hm/10,1)); width=max(16,int(round(wm/10*k))); height=max(16,int(round(hm/10*k)))
+    next_month=(period.replace(day=28)+timedelta(days=4)).replace(day=1)
+    end=min(date.today(),next_month-timedelta(days=1))
+    payload={'input':{'bounds':{'bbox':bbox,'geometry':geom,'properties':{'crs':'http://www.opengis.net/def/crs/OGC/1.3/CRS84'}},
+             'data':[{'type':'sentinel-2-l2a','dataFilter':{'timeRange':{'from':period.isoformat()+'T00:00:00Z','to':end.isoformat()+'T23:59:59Z'},
+                      'mosaickingOrder':'leastCC'}}]},
+             'output':{'width':width,'height':height,'responses':[{'identifier':'default','format':{'type':'image/png'}}]},
              'evalscript':MAP_SCRIPTS[layer]}
     try:
         data=_process_image(payload,_copernicus_access_token())
