@@ -27,14 +27,24 @@ function buildRasterMap(el,fail){
  base.on('tileload',()=>{loaded++;el.dataset.tilesLoaded='true';clearTimeout(timer);el.querySelector('.map-error')?.remove()});
  base.on('tileerror',()=>{if(++errors>=3&&!live){if(satellite){addBase(false);say(status.textContent+' · '+(ar()?'تعذر مصدر الصور؛ تم الرجوع للشوارع':'Imagery failed; using streets'))}else fail(ar()?'تعذر تحميل خريطة الشوارع. بيانات المناطق متاحة أدناه.':'Street tiles unavailable. Area data remains available below.')}});base.addTo(map);
  clearTimeout(timer);timer=setTimeout(()=>{if(S.map===map&&!loaded)fail(ar()?'انتهت مهلة تحميل الخريطة؛ أعد المحاولة.':'Map loading timed out; retry.')},20000)}addBase(satellite);map.on('unload',()=>clearTimeout(timer));
+ const shown=(S.view==='area'?[selectedArea()].filter(Boolean):S.data.areas);
  if(live){
-  const name=ar()?s2[1]:s2[2];
-  s2tiles=window.L.tileLayer(`/api/tiles/${mode}/{z}/{x}/{y}.png?month=${encodeURIComponent(S.mapMonth)}&cc=${S.mapCC}`,{minZoom:9,maxNativeZoom:17,maxZoom:18,zIndex:5,attribution:`Contains modified Copernicus Sentinel data ${S.mapMonth.slice(0,4)} · Copernicus Data Space Ecosystem`}).addTo(map);
-  say(`Copernicus Sentinel-2 L2A · ${name} · ${S.mapMonth} · ${ar()?'غيوم':'clouds'} ≤ ${S.mapCC}%`+(map.getZoom()<9?' · '+(ar()?'قرّب الخريطة لعرض الطبقة':'zoom in to see the layer'):''));
-  s2tiles.on('tileload',()=>{loaded++;clearTimeout(timer)});
-  s2tiles.on('tileerror',()=>{if(++s2errors===3)say(`${t('copernicusFailed')} · ${ar()?'تعذر تحميل بعض بلاطات Sentinel-2 (قد تكون الحصة أو الشهر بلا صور)':'Some Sentinel-2 tiles failed (quota, or no scenes for this month)'}`)});
-  map.on('zoomend',()=>{if(map.getZoom()<9)say(ar()?'قرّب الخريطة (مستوى ٩ فأكثر) لعرض طبقة Sentinel-2 لمنطقة جدة':'Zoom in (level 9+) to see the Sentinel-2 layer over Jeddah')});
+  /* One coloured Sentinel-2 image per park, clipped to its boundary (/api/areas/{id}/overlay/{layer}.png),
+     drawn over Esri imagery. Loaded a few at a time so the server never gets flooded. */
+  const name=ar()?s2[1]:s2[2],legend=ar()?s2[4]:s2[5];let ok=0,bad=0,lastErr='';
+  const report=()=>say(`Copernicus Sentinel-2 L2A · ${name} · ${S.mapMonth}`+(legend?` · ${legend}`:'')+` · ${ar()?'ملوّنة':'coloured'} ${ok}/${shown.length}`+(bad?` · ${ar()?'تعذّر':'failed'} ${bad}${lastErr?' ('+lastErr+')':''}`:''));
+  report();
+  const queue=shown.slice();
+  const next=async()=>{const a=queue.shift();if(!a||S.map!==map)return;
+   try{const r=await fetch(`/api/areas/${a.id}/overlay/${mode}.png?month=${encodeURIComponent(S.mapMonth)}`,{credentials:'same-origin'});
+    if(!r.ok){let d='';try{d=(await r.json()).detail||''}catch(e){}throw new Error(d||('HTTP '+r.status))}
+    const url=URL.createObjectURL(await r.blob());if(S.map!==map)return;
+    const pts=a.geometry.coordinates.flat();const xs=pts.map(p=>+p[0]),ys=pts.map(p=>+p[1]);
+    window.L.imageOverlay(url,[[Math.min(...ys),Math.min(...xs)],[Math.max(...ys),Math.max(...xs)]],{opacity:.9,zIndex:5,interactive:false}).addTo(map);ok++;loaded++;clearTimeout(timer);
+   }catch(e){bad++;lastErr=String(e.message||e).slice(0,80)}
+   if(S.map===map){report();await next()}};
+  Promise.all([next(),next(),next()]);
  }
- for(const a of (S.view==='area'?[selectedArea()].filter(Boolean):S.data.areas)){const color=({stable:'#36ba80',monitor:'#e4ad4c',high:'#d96a62'})[a.metrics.status]||'#9eafb0';const polygon=window.L.geoJSON(a.geometry,{style:{color,weight:live?2.5:3,fillOpacity:live?0.03:.2}}).addTo(map);polygon.bindPopup(`<b>${esc(areaLabel(a))}</b><p>${origin(a)} · NDVI ${fmt(a.metrics.current_ndvi)}</p>${btn(t('areaDetails'),'open-area',{id:a.id})} <a class="btn tiny" href="${esc(copernicusBrowserUrl(a,s2?mode:'ndvi'))}" target="_blank" rel="noopener">Copernicus Browser ↗</a>`);window.L.marker(polygon.getBounds().getCenter(),{icon:window.L.divIcon({className:'map-marker',html:esc(areaLabel(a).split(' ').at(-1)),iconSize:[30,30]})}).bindPopup(polygon.getPopup()).addTo(map);if((S.mapFocus||S.view==='area')&&a.id===S.areaId)map.fitBounds(polygon.getBounds(),{padding:[65,65],maxZoom:15,animate:false})}
+ for(const a of shown){const color=({stable:'#36ba80',monitor:'#e4ad4c',high:'#d96a62'})[a.metrics.status]||'#9eafb0';const polygon=window.L.geoJSON(a.geometry,{style:{color,weight:live?2.5:3,fillOpacity:live?0:.2}}).addTo(map);polygon.bindPopup(`<b>${esc(areaLabel(a))}</b><p>${origin(a)} · NDVI ${fmt(a.metrics.current_ndvi)}</p>${btn(t('areaDetails'),'open-area',{id:a.id})} <a class="btn tiny" href="${esc(copernicusBrowserUrl(a,s2?mode:'ndvi'))}" target="_blank" rel="noopener">Copernicus Browser ↗</a>`);window.L.marker(polygon.getBounds().getCenter(),{icon:window.L.divIcon({className:'map-marker',html:esc(areaLabel(a).split(' ').at(-1)),iconSize:[30,30]})}).bindPopup(polygon.getPopup()).addTo(map);if((S.mapFocus||S.view==='area')&&a.id===S.areaId)map.fitBounds(polygon.getBounds(),{padding:[65,65],maxZoom:15,animate:false})}
  const label=document.createElement('div');label.className='map-demo';label.textContent=t('demoBoundaries');el.appendChild(label);
 }
