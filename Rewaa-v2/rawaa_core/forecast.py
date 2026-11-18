@@ -152,9 +152,18 @@ def forecast(pts, today: date | None = None) -> dict:
         return {'available': False, 'kind': 'forecast', 'n': n,
                 'reason_ar': 'تعذّر اختبار النماذج على السجل التاريخي.', 'reason_en': 'Backtesting was not possible.'}
     board.sort(key=lambda b: (-b['skill_pct'], b['mae']))
-    best = board[0] if board[0]['skill_pct'] > 0 else next(b for b in board if b['model'] == 'naive')
+    best, f = None, None
+    for b in board:  # best skill first; a model that cannot be fitted on the full series is skipped
+        if b['skill_pct'] <= 0:
+            break
+        f = FITTERS[b['model']](pts)
+        if f is not None:
+            best = b
+            break
+    if best is None:
+        best = next(b for b in board if b['model'] == 'naive')
+        f = _fit_naive(pts)
     model = best['model']
-    f = FITTERS[model](pts)
     gaps = [(pts[i + 1][0] - pts[i][0]).days for i in range(len(pts) - 1)]
     step = max(5, statistics.median(gaps))
     sd = max(best['rmse'], 0.01)
