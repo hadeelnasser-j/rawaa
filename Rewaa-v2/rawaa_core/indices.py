@@ -97,7 +97,7 @@ def build_evalscript() -> str:
 // RAWAA {PROCESSING_VERSION}: per-acquisition statistics inside the park polygon.
 // SCL classes excluded: [{excluded}] (no data, defective, shadows, water, clouds, cirrus, snow).
 function setup() {{
-  return {{ input: [{{bands:["B02","B03","B04","B05","B08","B8A","B11","SCL","dataMask"], units:"REFLECTANCE"}}],
+  return {{ input: [{{bands:["B02","B03","B04","B05","B08","B8A","B11","SCL","dataMask"]}}],
     output: [ {{id:"ndvi",bands:1,sampleType:"FLOAT32"}}, {{id:"ndmi",bands:1,sampleType:"FLOAT32"}},
               {{id:"ndwi",bands:1,sampleType:"FLOAT32"}}, {{id:"savi",bands:1,sampleType:"FLOAT32"}},
               {{id:"ndre",bands:1,sampleType:"FLOAT32"}}, {{id:"salinity",bands:1,sampleType:"FLOAT32"}},
