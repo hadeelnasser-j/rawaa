@@ -305,7 +305,7 @@ async function rawaaIntelSubmit(form){const f=new FormData(form),id=Number(form.
  if(form.id==='pm-review-form')return perform(async()=>{await api(`/tasks/${id}/review`,{method:'POST',body:{outcome:f.get('outcome'),notes:f.get('notes')||''}});toast(L2('حُفظ التقييم','Review saved'))});
  if(form.id==='pm-sched-form')return perform(async()=>{await api(`/schedule/${id}`,{method:'PATCH',body:{next_check:f.get('next_check'),notes:f.get('notes')||''}});toast(t('save'))});
  if(form.id==='pm-bnd-review-form')return perform(async()=>{const r=await api(`/areas/${id}/boundary/review`,{method:'POST',body:{decision:form.dataset.decision,notes:f.get('notes')||''}});toast(r.status==='approved'?L2('اعتُمدت الحدود','Boundary approved'):L2('سُجّل قرار الحدود','Boundary decision saved'))});
- if(form.id==='pm-bnd-form'){let geometry;try{geometry=JSON.parse(f.get('geojson'))}catch{toast('GeoJSON',true);return}
+ if(form.id==='pm-bnd-form'){let geometry;try{geometry=JSON.parse(f.get('geojson'));if(geometry&&geometry.type==='FeatureCollection')geometry=(geometry.features||[])[0];if(geometry&&geometry.type==='Feature')geometry=geometry.geometry}catch{toast('GeoJSON',true);return}if(!geometry||geometry.type!=='Polygon'){toast(L2('الصقي مضلعًا واحدًا (Polygon)','Paste a single Polygon'),true);return}
   return perform(async()=>{const r=await api(`/areas/${id}/boundary`,{method:'PUT',body:{geometry,source:f.get('source'),notes:f.get('notes')||''}});toast(L2(`حُفظ الإصدار ${r.version} من الحدود`,`Boundary v${r.version} saved`))})}}
 
 /* Menus close on outside click / after choosing; the side panel closes when the user navigates away or presses Esc. */
