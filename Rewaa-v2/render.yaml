@@ -1,0 +1,38 @@
+# Render Blueprint for RAWAA | رَوَاء
+# One Python web service. No secrets live in this file: values marked "sync: false"
+# are entered in the Render Dashboard.
+# The database is Neon PostgreSQL via DATABASE_URL (no Render Postgres is created).
+services:
+  - type: web
+    name: rawaa
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      # Neon PostgreSQL connection string; set it in the Render Dashboard only (never in GitHub).
+      - key: DATABASE_URL
+        sync: false
+      - key: RAWAA_SECURE_COOKIE
+        value: "1"
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"
+      - key: RAWAA_AUTO_PIPELINE
+        value: "1"
+      - key: RAWAA_PIPELINE_HOURS
+        value: "12"
+      - key: RAWAA_LOG_LEVEL
+        value: INFO
+      # Copernicus Data Space OAuth client (needed for real Sentinel-2 / Landsat readings).
+      # Leave empty at first if you do not have it yet; add it later under Environment.
+      - key: COPERNICUS_CLIENT_ID
+        sync: false
+      - key: COPERNICUS_CLIENT_SECRET
+        sync: false
+      # Uncomment to turn off the demo role switcher for real (non-demo) use:
+      # - key: RAWAA_ENV
+      #   value: production
+
