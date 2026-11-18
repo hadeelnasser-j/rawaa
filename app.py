@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import re
 from maintenance_engine import maintenance_engine, MONTHLY_MAINTENANCE, ndvi_drop_activities
 from plant_catalog import PLANTS, parse_species, species_summary, salt_tolerant
@@ -21,6 +22,7 @@ import os
 import secrets
 import sqlite3
 import statistics
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -33,20 +35,44 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from rawaa_core import geo as rgeo, indices as rindices, migrations as rmigrations
+
+# Local development: read settings from a .env file next to app.py if one exists.
+# Real environment variables (e.g. on Render) always take precedence; tests set RAWAA_NO_DOTENV=1.
+if os.getenv('RAWAA_NO_DOTENV')!='1':
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent/'.env',override=False)
+    except ImportError:
+        pass
+
+logging.basicConfig(level=os.getenv('RAWAA_LOG_LEVEL', 'INFO'),
+                    format='%(asctime)s %(levelname)s %(name)s %(message)s')
+log = logging.getLogger('rawaa')
+
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get('RAWAA_DB') or ROOT / 'data' / 'rawaa.sqlite3')
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title='Rawaa | رَوَاء API', version='0.1.0')
+app = FastAPI(title='Rawaa | رَوَاء API', version='0.2.0')
 app.mount('/static', StaticFiles(directory=str(ROOT / 'static')), name='static')
 
 @app.middleware('http')
 async def _revalidate_static(request, call_next):
     """Make browsers re-check the page and its scripts on every visit (cheap ETag check),
     so a new deployment shows up immediately instead of an old cached copy."""
-    response=await call_next(request)
+    t0=time.perf_counter();rid=secrets.token_hex(6)
+    try:
+        response=await call_next(request)
+    except Exception:
+        log.exception('request %s %s %s failed',rid,request.method,request.url.path)
+        return JSONResponse({'detail':'Internal server error','request_id':rid},status_code=500)
     path=request.url.path
     if path=='/' or path.endswith(('.js','.css','.html')):
         response.headers['Cache-Control']='no-cache'
+    response.headers['X-Request-ID']=rid
+    if path.startswith('/api/') and not path.startswith('/api/tiles/'):
+        lvl=logging.WARNING if response.status_code>=500 else logging.INFO
+        log.log(lvl,'%s %s %s %d %.0fms',rid,request.method,path,response.status_code,(time.perf_counter()-t0)*1000)
     return response
 DB_LOCK = threading.RLock()
 
@@ -57,7 +83,8 @@ def utcnow():
 # --- Database: SQLite locally (RAWAA_DB), PostgreSQL in production when DATABASE_URL is set (e.g. Neon). ---
 DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 IS_PG=DATABASE_URL.startswith(('postgres://','postgresql://'))
-_TABLES_WITH_ID={'users','sessions','areas','observations','alerts','tasks','activity'}
+_TABLES_WITH_ID={'users','sessions','areas','observations','alerts','tasks','activity','thermal','labels',
+                 'boundary_history','predictions','monitoring_schedule','pipeline_runs'}
 
 class _Row(dict):
     """Row usable like sqlite3.Row: row['col'], row[0], dict(row)."""
@@ -268,7 +295,7 @@ REAL_SITES = [
      'حالة ٥ · مرشّحة لإجهاد حيوي/تشبع مائي وإهمال (حي أبرق الرغامة). الترشيح من تقييمات الزوار العامة ويحتاج تأكيد الأمانة',
      'Case 5 · Candidate biotic stress / waterlogging and neglect (Abruq Al-Rughamah). Based on public reviews; needs municipality confirmation',_poly(lat=21.5008814,lng=39.2719418),'approx'),
     # Field-validation sites supplied by the team, to compare with the municipality's own records
-    ('Validation site 1','حديقة تهامة — موقع التحقق ١','Validation site',
+    ('Validation site 1','حديقة تهامة (موقع التحقق ١)','Validation site',
      'موقع تحقق للمقارنة مع نتائج الأمانة (حي العزيزية)','Validation site for comparison with municipality results (Al Aziziyah)',_poly('tihamah'),'OSM way 628578775'),
     ('Validation site 2','موقع التحقق ٢','Validation site',
      'موقع تحقق للمقارنة مع نتائج الأمانة (حي الشاطئ، قرب الساحل)','Validation site for comparison with municipality results (Ash Shati, near the coast)',_poly(lat=21.6531027,lng=39.1083515),'approx'),
@@ -280,9 +307,13 @@ SITE_INFO = {r[0]:{'role_ar':r[3],'role_en':r[4],'boundary_source':r[6]} for r i
 def ensure_validation_sites():
     with connect() as db:
         for en,ar,cat,_ra,_re,geom,src in REAL_SITES:
-            row=db.execute('SELECT id FROM areas WHERE name_en=?',(en,)).fetchone()
+            row=db.execute('SELECT * FROM areas WHERE name_en=?',(en,)).fetchone()
             if row:
-                db.execute('UPDATE areas SET name_ar=?,category=?,geometry=? WHERE id=?',(ar,cat,json.dumps(geom),row[0]))
+                # Never overwrite a boundary that was edited (version > 1) or reviewed by the authority.
+                if ('boundary_version' in row.keys() and ((row['boundary_version'] or 1)>1 or row['boundary_status'] in ('approved','rejected'))):
+                    db.execute('UPDATE areas SET name_ar=?,category=? WHERE id=?',(ar,cat,row['id']))
+                else:
+                    db.execute('UPDATE areas SET name_ar=?,category=?,geometry=? WHERE id=?',(ar,cat,json.dumps(geom),row['id']))
                 continue
             db.execute('INSERT INTO areas(name_ar,name_en,category,assigned_operator,geometry,irrigation,plants,planting_date,demo,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
                 (ar,en,cat,2,json.dumps(geom),'','',None,0,utcnow()))
@@ -303,8 +334,8 @@ def purge_demo_areas():
         db.execute(f'DELETE FROM tasks WHERE area_id IN ({q})',ids)
         db.execute(f'DELETE FROM alerts WHERE area_id IN ({q})',ids)
         db.execute(f'DELETE FROM observations WHERE area_id IN ({q}) OR is_demo=1',ids)
-        for tb in ('thermal','labels'):
-            db.execute(f'DELETE FROM {tb} WHERE area_id IN ({q})',ids)
+        for tb in ('thermal','labels','boundary_history','predictions','monitoring_schedule'):
+            if table_columns(db,tb): db.execute(f'DELETE FROM {tb} WHERE area_id IN ({q})',ids)
         db.execute(f'DELETE FROM areas WHERE id IN ({q})',ids)
 
 
@@ -330,6 +361,24 @@ def migrate_spectral_columns():
             db.execute('ALTER TABLE task_photos ADD COLUMN data '+('BYTEA' if IS_PG else 'BLOB'))
 
 migrate_spectral_columns()
+
+# Versioned migrations (rawaa_core/migrations.py): provenance, boundaries, predictions, schedule, follow-up.
+rmigrations.run(connect,table_columns,{'now':utcnow,'source_for':lambda name:SITE_INFO.get(name,{}).get('boundary_source')})
+
+def backfill_boundaries():
+    """Boundary metadata for parks added after the migration ran (new sites, user-created areas)."""
+    with connect() as db:
+        for a in db.execute('SELECT id,name_en,geometry,boundary_status,boundary_source FROM areas WHERE boundary_status IS NULL OR area_m2 IS NULL').fetchall():
+            g=json.loads(a['geometry']);rep=rgeo.validate(g)
+            src=a['boundary_source'] or SITE_INFO.get(a['name_en'],{}).get('boundary_source') or 'user-supplied'
+            st=a['boundary_status'] or (rgeo.initial_status(src,rep.get('placeholder',False)) if rep['valid'] else 'needs_review')
+            db.execute('UPDATE areas SET boundary_status=?,boundary_source=?,boundary_version=COALESCE(boundary_version,1),area_m2=?,perimeter_m=? WHERE id=?',
+                       (st,src,rep.get('area_m2'),rep.get('perimeter_m'),a['id']))
+            if not db.execute('SELECT 1 FROM boundary_history WHERE area_id=?',(a['id'],)).fetchone():
+                db.execute('INSERT INTO boundary_history(area_id,version,geometry,source,status,action,user_id,notes,area_m2,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                           (a['id'],1,a['geometry'],src,st,'initial',None,'',rep.get('area_m2'),utcnow()))
+
+backfill_boundaries()
 purge_demo_areas()
 
 
@@ -369,11 +418,15 @@ def same_season(rows,latest):
     return out if len(out)>=2 else []
 
 def metrics(area_id, db):
-    rows=[dict(r) for r in db.execute('SELECT measured_at,ndvi,ndmi,ndwi,savi,ndre,salinity,ndvi_std,valid_pixels_pct,source,is_demo FROM observations WHERE area_id=? ORDER BY measured_at', (area_id,))]
+    rows=[dict(r) for r in db.execute('SELECT id,measured_at,acquired_at,ndvi,ndmi,ndwi,savi,ndre,salinity,ndvi_std,valid_pixels_pct,source,origin,reliability,scene_ids,boundary_version,is_demo FROM observations WHERE area_id=? ORDER BY measured_at', (area_id,))]
     return metrics_from_rows(rows)
 
 def metrics_from_rows(rows):
     real=[r for r in rows if not r['is_demo'] and r['ndvi'] is not None]
+    # Satellite readings take precedence; imported/manual values are only shown when no satellite data exists
+    # and are never used by the automatic decision pipeline (intelligence_api.py).
+    sat=[r for r in real if r.get('origin')=='satellite' and r.get('reliability')!='unreliable']
+    if sat: real=sat
     series=real if real else [r for r in rows if r['is_demo']]
     quality=[r for r in series if r['valid_pixels_pct'] >= 60]
     # A minimum of 3 valid chronological observations is required for even a provisional label.
@@ -542,11 +595,11 @@ def build_insight(area,peers=None):
             f"{meaning_ar} القيمة الآن {latest[k]:.3f} والمعتاد لهذه الحديقة {r['median']:.3f}؛ أي {abs(zz):.1f} انحراف معياري {'تحت' if zz<0 else 'فوق'} المعتاد. "+("هذا انحراف ملحوظ (1σ أو أكثر)." if abs(zz)>=1 else "ضمن المعتاد."),
             f"{meaning_en} Now {latest[k]:.3f}; usual for this park {r['median']:.3f}: {zz:+.1f}σ. "+("Notable deviation (≥1σ)." if abs(zz)>=1 else "Within normal."))
         return zz
-    zw=zline('ndmi','NDMI (رطوبة النبات)','NDMI (plant moisture)','NDMI يقيس الماء داخل أوراق النبات؛ انخفاضه يعني عطشًا.','NDMI measures leaf water; a drop means thirst.')
+    zw=zline('ndmi','NDMI (رطوبة النبات)','NDMI (plant moisture)','NDMI يقيس الماء داخل أوراق النبات؛ انخفاضه قد يدل على عطش.','NDMI measures leaf water; a drop can indicate thirst.')
     zl=zline('ndwi','NDWI (الماء السطحي)','NDWI (surface water)','NDWI يرتفع مع الماء المكشوف أو التربة المشبعة.','NDWI rises with open water or saturated soil.')
     zc=zline('ndre','NDRE (الكلوروفيل)','NDRE (chlorophyll)','NDRE يعكس الكلوروفيل والتغذية؛ انخفاضه مع رطوبة طبيعية يشير لنقص تغذية.','NDRE reflects chlorophyll/nutrition.')
     zs=zline('salinity','SI (مؤشر الملوحة التقريبي)','SI (approx. salinity)','SI مؤشر سطوع يرتفع مع القشور الملحية والتربة المكشوفة، وهو تقريبي.','SI is a brightness index that rises with salt crusts and bare soil; approximate.')
-    zp=zline('ndvi_std','تباين NDVI داخل الحديقة','Within-park NDVI variability','ارتفاع التباين يعني أن أجزاء من الحديقة تتدهور بينما أخرى سليمة.','Higher variability means some parts decline while others stay healthy.')
+    zp=zline('ndvi_std','تباين NDVI داخل الحديقة','Within-park NDVI variability','ارتفاع التباين قد يعني أن أجزاء من الحديقة تتدهور بينما أخرى سليمة.','Higher variability can mean some parts decline while others stay healthy.')
     # --- thermal (Landsat 8/9): park surface temperature and its cooling effect vs ~300 m surroundings
     th=[t for t in (area.get('thermal') or []) if _fin(t.get('lst_park'))]
     z_lst=None;cooling=None;z_cool=None
@@ -557,7 +610,7 @@ def build_insight(area,peers=None):
         lst_ref={'median':statistics.median([t['lst_park'] for t in ref_rows]),'std':max(statistics.pstdev([t['lst_park'] for t in ref_rows]),0.7)}
         z_lst=(tl['lst_park']-lst_ref['median'])/lst_ref['std']
         add('lst','LST (حرارة سطح الحديقة °م)','LST (park surface °C)',tl['lst_park'],f"المعتاد لهذا الوقت {lst_ref['median']:.1f} ± {lst_ref['std']:.1f} · الانحراف {z_lst:+.1f}σ",'bad' if z_lst>=1 else 'ok',
-            f"حرارة سطح الحديقة من القمر Landsat ({tl['measured_at'][:7]}) {tl['lst_park']:.1f}°م، والمعتاد لهذا الوقت من السنة {lst_ref['median']:.1f}°م؛ أي {abs(z_lst):.1f} انحراف معياري {'فوق' if z_lst>0 else 'تحت'} المعتاد. ارتفاعها يعني أن النبات يفقد قدرته على التبريد بالنتح.",
+            f"حرارة سطح الحديقة من القمر Landsat ({tl['measured_at'][:7]}) {tl['lst_park']:.1f}°م، والمعتاد لهذا الوقت من السنة {lst_ref['median']:.1f}°م؛ أي {abs(z_lst):.1f} انحراف معياري {'فوق' if z_lst>0 else 'تحت'} المعتاد. ارتفاعها قد يعني أن النبات يفقد قدرته على التبريد بالنتح.",
             f"Park surface temperature (Landsat) {tl['lst_park']:.1f}°C vs usual {lst_ref['median']:.1f}°C ({z_lst:+.1f}σ).")
         cools=[t['lst_ring']-t['lst_park'] for t in th if _fin(t.get('lst_ring'))]
         if _fin(tl.get('lst_ring')):
@@ -595,7 +648,7 @@ def build_insight(area,peers=None):
     if lowveg: notes_ar.append('الغطاء النباتي في هذه الحديقة منخفض أصلًا (NDVI < 0.15)، أي أن جزءًا كبيرًا منها ممرات أو تربة؛ لذلك تتضخّم النسب المئوية للتغير.');notes_en.append('Low vegetation cover (NDVI < 0.15): percentage changes are amplified.')
     if maint and dx!='maintenance': notes_ar.append(f"شهر القراءة ({_MONTHS_AR[month-1]}) أو الذي قبله فيه صيانة مجدولة قد تخفض المؤشر مؤقتًا، وأُخذ ذلك في الحسبان.");notes_en.append('Scheduled maintenance this or last month can lower NDVI briefly; taken into account.')
     if coastal: notes_ar.append('موقع ساحلي: رذاذ البحر والملوحة عاملان محتملان.');notes_en.append('Coastal site: sea spray and salinity are plausible factors.')
-    if q_valid<80: notes_ar.append(f"نسبة البكسلات الصافية في آخر قراءة {q_valid:.0f}% (أقل من 80%)، فالدقة أقل.");notes_en.append(f"Clear-sky share in the last reading was {q_valid:.0f}% (<80%): lower precision.")
+    if q_valid<80: notes_ar.append(f"نسبة البكسلات الصافية في آخر قراءة {q_valid:.0f}% (أقل من 80%)، فموثوقية القراءة محدودة.");notes_en.append(f"Clear-sky share in the last reading was {q_valid:.0f}% (<80%): limited reliability.")
     title_ar,title_en=_DX[dx]
     top=[e for e in ev if e['verdict']=='bad'][:3]
     summary_ar=f"التشخيص: {title_ar} (ثقة {conf_ar}). "+(("الأدلة: "+"؛ ".join(f"{e['label_ar'].split(' (')[0]} {e['value']}" for e in top)+". ") if top else "")+ \
@@ -696,11 +749,23 @@ class Login(BaseModel):
 @app.get('/')
 def home(): return FileResponse(ROOT / 'static' / 'index.html')
 
+LOGIN_WINDOW_S=15*60; LOGIN_MAX_FAILS=8
+
 @app.post('/api/login')
-def login(v:Login, response:Response):
+def login(v:Login, req:Request, response:Response):
+    email=v.email.lower().strip();ip=(req.client.host if req.client else '')[:64];now=int(time.time())
     with connect() as db:
-        u=db.execute('SELECT * FROM users WHERE email=?',(v.email.lower().strip(),)).fetchone()
-        if not u or not password_ok(v.password,u['pw_hash']): raise HTTPException(401,'Invalid credentials')
+        fails=db.execute('SELECT count(*) FROM login_attempts WHERE email=? AND ok=0 AND at>?',(email,now-LOGIN_WINDOW_S)).fetchone()[0]
+        if fails>=LOGIN_MAX_FAILS: raise HTTPException(429,'Too many failed attempts; try again in 15 minutes')
+        u=db.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+        ok=bool(u and password_ok(v.password,u['pw_hash']))
+        db.execute('INSERT INTO login_attempts(email,ip,at,ok) VALUES(?,?,?,?)',(email,ip,now,int(ok)))
+        db.execute('DELETE FROM login_attempts WHERE at<?',(now-86400,))
+        db.execute('DELETE FROM sessions WHERE expires<?',(now,))
+    if not ok:
+        log.warning('failed login for %s from %s',email,ip)
+        raise HTTPException(401,'Invalid credentials')
+    with connect() as db:
         token=secrets.token_urlsafe(40)
         db.execute('INSERT INTO sessions(user_id,token_hash,expires) VALUES (?,?,?)',
                    (u['id'],hashlib.sha256(token.encode()).hexdigest(),int(time.time())+86400))
@@ -804,8 +869,14 @@ def add_area(v:AreaCreate,req:Request):
     with connect() as db:
         assigned=db.execute('SELECT id FROM users WHERE id=? AND role=\'operator\'',(v.assigned_operator,)).fetchone()
         if not assigned: raise HTTPException(400,'Operator not found')
-        c=db.execute('''INSERT INTO areas(name_ar,name_en,geometry,irrigation,plants,planting_date,assigned_operator,demo,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?)''',(v.name_ar,v.name_en,json.dumps(v.geometry),v.irrigation,v.plants,v.planting_date,v.assigned_operator,0,utcnow()))
+        rep=rgeo.validate(v.geometry)
+        if not rep['valid']: raise HTTPException(400,{'message':'Invalid boundary','errors':rep['errors']})
+        c=db.execute('''INSERT INTO areas(name_ar,name_en,geometry,irrigation,plants,planting_date,assigned_operator,demo,created_at,
+            boundary_status,boundary_source,boundary_version,area_m2,perimeter_m)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(v.name_ar,v.name_en,json.dumps(v.geometry),v.irrigation,v.plants,v.planting_date,v.assigned_operator,0,utcnow(),
+            rgeo.initial_status('user-supplied',rep['placeholder']),'user-supplied',1,rep['area_m2'],rep['perimeter_m']))
+        db.execute('INSERT INTO boundary_history(area_id,version,geometry,source,status,action,user_id,notes,area_m2,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+            (c.lastrowid,1,json.dumps(v.geometry),'user-supplied',rgeo.initial_status('user-supplied',rep['placeholder']),'create',u['id'],'',rep['area_m2'],utcnow()))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',(u['id'],'create_area',str(c.lastrowid),v.name_en,utcnow()))
         return full_area(db,db.execute('SELECT * FROM areas WHERE id=?',(c.lastrowid,)).fetchone())
 
@@ -923,16 +994,17 @@ def import_csv(area_id:int,v:CSVImport,req:Request):
     except (ValueError,TypeError,AttributeError,KeyError) as e:
         raise HTTPException(400,f'Invalid CSV row: {e}')
     with connect() as db:
-        area_access(db,u,area_id)
+        area_row=area_access(db,u,area_id)
         for d,ndvi,ndmi,q in clean:
-            db.execute('''INSERT INTO observations(area_id,measured_at,ndvi,ndmi,valid_pixels_pct,source,is_demo,created_at)
-                VALUES(?,?,?,?,?,'Imported CSV (user supplied)',0,?)
+            db.execute('''INSERT INTO observations(area_id,measured_at,ndvi,ndmi,valid_pixels_pct,source,is_demo,created_at,origin,reliability,boundary_version)
+                VALUES(?,?,?,?,?,'Imported CSV (user supplied)',0,?,'imported','unverified',?)
                 ON CONFLICT(area_id,measured_at,source) DO UPDATE SET ndvi=excluded.ndvi,
                 ndmi=excluded.ndmi,valid_pixels_pct=excluded.valid_pixels_pct''',
-                (area_id,d,ndvi,ndmi,q,utcnow()))
+                (area_id,d,ndvi,ndmi,q,utcnow(),area_row['boundary_version'] or 1))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
                    (u['id'],'import_csv',str(area_id),f'{len(clean)} user-supplied records',utcnow()))
-    return {'imported':len(clean),'note':'Imported values are user-provided; provenance must be confirmed separately.'}
+    return {'imported':len(clean),'origin':'imported','reliability':'unverified',
+            'note':'Imported values are user-provided and kept separate from satellite readings: they are displayed but never drive automatic alerts, priorities or forecasts.'}
 
 @app.get('/api/alerts')
 def list_alerts(req:Request):
@@ -962,9 +1034,20 @@ def assign_alert(alert_id:int,v:AssignAlert,req:Request):
         if ins and ins.get('verify_ar'): notes+='\nالتحقق من النجاح: '+ins['verify_ar']
         title_ar='تحقق وصيانة — '+ins['title_ar'] if ins and ins['diagnosis'] not in ('insufficient','healthy','improving') else 'تحقق وصيانة'
         title_en='Inspection & maintenance — '+ins['title_en'] if ins and ins['diagnosis'] not in ('insufficient','healthy','improving') else 'Inspection & maintenance'
-        c=db.execute('''INSERT INTO tasks(area_id,alert_id,title_ar,title_en,assigned_to,status,priority,due_at,notes,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(a['area_id'],alert_id,title_ar,title_en,
-             a['assigned_operator'],'open',v.priority,v.due_at,notes,utcnow(),utcnow()))
+        # Snapshot of the latest trusted satellite reading, used later to compare before/after the intervention.
+        import intelligence_api as _intel
+        from rawaa_core.series import trusted_series as _ts, reading_date as _rd
+        area_row=dict(db.execute('SELECT * FROM areas WHERE id=?',(a['area_id'],)).fetchone())
+        tser=_ts(_intel.observations(db,a['area_id']),area_row.get('boundary_version') or 1)
+        base=tser[-1] if tser else None
+        sched=db.execute("SELECT id,next_check FROM monitoring_schedule WHERE area_id=? AND status IN ('scheduled','in_progress') ORDER BY id DESC",(a['area_id'],)).fetchone()
+        due=v.due_at or (sched['next_check'] if sched else None)
+        c=db.execute('''INSERT INTO tasks(area_id,alert_id,title_ar,title_en,assigned_to,status,priority,due_at,notes,created_at,updated_at,
+            schedule_id,baseline_ndvi,baseline_date)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(a['area_id'],alert_id,title_ar,title_en,
+             a['assigned_operator'],'open',v.priority,due,notes,utcnow(),utcnow(),
+             sched['id'] if sched else None,base['ndvi'] if base else None,_rd(base) if base else None))
+        if sched: db.execute("UPDATE monitoring_schedule SET task_id=?, status='in_progress', updated_at=? WHERE id=?",(c.lastrowid,utcnow(),sched['id']))
         db.execute('UPDATE alerts SET status=\'assigned\' WHERE id=?',(alert_id,))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
                    (u['id'],'assign_task',str(c.lastrowid),f'alert {alert_id}',utcnow()))
@@ -982,9 +1065,13 @@ def list_tasks(req:Request):
 class TaskPatch(BaseModel):
     status:str|None=None
     confirmed_cause:str|None=None
-    actual_cause:str|None=None
-    action:str|None=None
-    notes:str|None=None
+    actual_cause:str|None=Field(default=None,max_length=400)
+    action:str|None=Field(default=None,max_length=400)
+    notes:str|None=Field(default=None,max_length=1000)
+    notes_before:str|None=Field(default=None,max_length=1000)
+    notes_after:str|None=Field(default=None,max_length=1000)
+    due_at:str|None=None
+    priority:str|None=None
 
 @app.patch('/api/tasks/{task_id}')
 def patch_task(task_id:int,v:TaskPatch,req:Request):
@@ -997,12 +1084,16 @@ def patch_task(task_id:int,v:TaskPatch,req:Request):
         allowed_ops={'open':{'in_progress'},'in_progress':{'pending_review'},'reopened':{'in_progress'},'pending_review':set(),'closed':set()}
         allowed_reg={'pending_review':{'closed','reopened'},'open':{'reopened'},'in_progress':{'reopened'},'closed':set(),'reopened':set()}
         fields={k:val for k,val in v.model_dump(exclude_none=True).items() if k!='status'}
+        if ('due_at' in fields or 'priority' in fields) and u['role']!='regulator':
+            raise HTTPException(403,'Only the regulator can change due date or priority')
+        if fields.get('priority') and fields['priority'] not in ('low','medium','high'): raise HTTPException(400,'Invalid priority')
         if v.status:
             allowed=(allowed_reg if u['role']=='regulator' else allowed_ops).get(t['status'],set())
             if v.status not in allowed: raise HTTPException(409,f'Invalid state transition: {t["status"]} -> {v.status}')
             if v.status=='pending_review' and not ((fields.get('actual_cause') or t['actual_cause']) and (fields.get('action') or t['action'])):
                 raise HTTPException(400,'Actual cause and action are required for review')
             fields['status']=v.status
+            if v.status=='pending_review': fields['completed_at']=utcnow()
         if not fields: raise HTTPException(400,'No fields supplied')
         fields['updated_at']=utcnow()
         sql='UPDATE tasks SET '+', '.join(f'{k}=?' for k in fields)+' WHERE id=?'
@@ -1014,6 +1105,11 @@ def patch_task(task_id:int,v:TaskPatch,req:Request):
             if cause: _add_label(db,t['area_id'],t['created_at'][:10],cause,'task',(t['actual_cause'] or '')[:400],task_id)
         if v.status=='closed' and t['alert_id']:
             db.execute('UPDATE alerts SET status=\'closed\' WHERE id=?',(t['alert_id'],))
+        if v.status=='closed':
+            db.execute("UPDATE monitoring_schedule SET status='done', completed_at=?, completed_by=?, updated_at=? WHERE task_id=? AND status IN ('scheduled','in_progress')",
+                       (utcnow(),u['id'],utcnow(),task_id))
+        if v.status=='reopened':
+            db.execute("UPDATE monitoring_schedule SET status='in_progress', updated_at=? WHERE task_id=?",(utcnow(),task_id))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
                    (u['id'],'update_task',str(task_id),json.dumps(fields,ensure_ascii=False),utcnow()))
         return asdict(db.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone())
@@ -1064,26 +1160,9 @@ def export_dataset(req:Request, include_demo:int=0):
     return Response('\ufeff'+out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="rawaa-training-dataset.csv"'})
 
 # --- Copernicus Data Space — Sentinel Hub Statistical API, optional OAuth integration ---
-EVALSCRIPT = '''//VERSION=3
-// Monthly spectral features for each site. SCL mask removes no-data, saturated, cloud shadow, water, clouds, cirrus, snow.
-function setup() {
-  return { input: [{bands:["B02","B03","B04","B05","B08","B8A","B11","SCL","dataMask"]}],
-    output: [ {id:"ndvi",bands:1,sampleType:"FLOAT32"}, {id:"ndmi",bands:1,sampleType:"FLOAT32"},
-              {id:"ndwi",bands:1,sampleType:"FLOAT32"}, {id:"savi",bands:1,sampleType:"FLOAT32"},
-              {id:"ndre",bands:1,sampleType:"FLOAT32"}, {id:"salinity",bands:1,sampleType:"FLOAT32"},
-              {id:"valid",bands:1,sampleType:"FLOAT32"}, {id:"dataMask",bands:1} ] };
-}
-function nd(a,b){ return (a+b)!==0 ? (a-b)/(a+b) : 0; }
-function evaluatePixel(s) {
-  let good = s.dataMask===1 && ![0,1,3,6,8,9,10,11].includes(s.SCL);
-  // dataMask = pixel inside the park polygon; masked (cloud etc.) pixels return NaN so they are excluded
-  // from index statistics, while "valid" gives the clear-sky share of the park itself.
-  let N = NaN;
-  let savi = (s.B08+s.B04+0.5)!==0 ? 1.5*(s.B08-s.B04)/(s.B08+s.B04+0.5) : 0;
-  return {ndvi:[good?nd(s.B08,s.B04):N], ndmi:[good?nd(s.B08,s.B11):N], ndwi:[good?nd(s.B03,s.B08):N], savi:[good?savi:N],
-          ndre:[good?nd(s.B8A,s.B05):N], salinity:[good?Math.sqrt(Math.max(0,s.B02*s.B04)):N], valid:[good?1:0], dataMask:[s.dataMask]};
-}
-'''
+# Legacy 30-day composite evalscript (rawaa-s2-v1) replaced by the scene-level one in rawaa_core/indices.py,
+# which also masks SCL class 2 (shadows) and reports vegetated share. Kept as a name for backwards compatibility.
+EVALSCRIPT = rindices.EVALSCRIPT
 
 def api_json(url, data, headers, timeout=40):
     payload=parse.urlencode(data).encode() if isinstance(data,dict) and headers.get('Content-Type','').startswith('application/x-www-form-urlencoded') else json.dumps(data).encode()
@@ -1165,12 +1244,24 @@ def _fetch_copernicus_token():
                     {'grant_type':'client_credentials','client_id':ident,'client_secret':secret},
                     {'Content-Type':'application/x-www-form-urlencoded'})['access_token']
 
+# At most a few Process API calls at once: a map can ask for dozens of images together, and unbounded
+# parallel calls exhaust the worker threads and freeze the whole site.
+_CDSE_SLOTS=threading.BoundedSemaphore(int(os.getenv('RAWAA_CDSE_CONCURRENCY','3')))
+
 def _process_image(payload, token):
+    if not _CDSE_SLOTS.acquire(timeout=25):
+        raise RuntimeError('Copernicus imagery busy; retry shortly')
+    try:
+        return _process_image_call(payload, token)
+    finally:
+        _CDSE_SLOTS.release()
+
+def _process_image_call(payload, token):
     req=request.Request('https://sh.dataspace.copernicus.eu/process/v1',
       data=json.dumps(payload).encode(),
       headers={'Content-Type':'application/json','Authorization':'Bearer '+token},method='POST')
     try:
-        with request.urlopen(req,timeout=80) as r:
+        with request.urlopen(req,timeout=45) as r:
             b=r.read(2_100_000)
             if not r.headers.get('Content-Type','').startswith('image/png') or len(b)>2_000_000:
                 raise RuntimeError('Unexpected imagery response')
@@ -1279,6 +1370,47 @@ def sentinel_tile(layer:str,z:int,x:int,y:int,req:Request,month:str='',cc:int=30
         pass
     return Response(data,media_type='image/png',headers=hdr)
 
+OVERLAY_DIR=Path(os.getenv('RAWAA_OVERLAY_CACHE','/tmp/rawaa-overlays'))
+
+@app.get('/api/areas/{area_id}/overlay/{layer}.png')
+def park_overlay(area_id:int,layer:str,req:Request,month:str=''):
+    """One coloured Sentinel-2 image per park, clipped to its polygon (transparent outside), cached on disk.
+    The map draws it over each park; far lighter than tiling the whole city."""
+    u=current_user(req)
+    if layer not in MAP_SCRIPTS: raise HTTPException(404,'Unknown layer')
+    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',month or ''): raise HTTPException(400,'month=YYYY-MM required')
+    period=date.fromisoformat(month+'-01')
+    if period>date.today().replace(day=1) or period.year<2017: raise HTTPException(400,'Month out of range')
+    with connect() as db:
+        a=area_access(db,u,area_id); geom=json.loads(a['geometry'])
+    validate_geometry(geom)
+    xs=[float(p[0]) for ring in geom['coordinates'] for p in ring]; ys=[float(p[1]) for ring in geom['coordinates'] for p in ring]
+    bbox=[min(xs),min(ys),max(xs),max(ys)]
+    if bbox[2]-bbox[0]>0.12 or bbox[3]-bbox[1]>0.12: raise HTTPException(422,'Area too large for an overlay')
+    gkey=hashlib.sha1(json.dumps(geom,sort_keys=True).encode()).hexdigest()[:12]
+    path=OVERLAY_DIR/str(area_id)/layer/month/f'{gkey}.png'
+    hdr={'Cache-Control':'private, max-age=86400','X-Rawaa-Bounds':','.join(f'{v:.6f}' for v in bbox)}
+    if path.exists(): return Response(path.read_bytes(),media_type='image/png',headers=hdr)
+    # ~10 m per pixel, capped at 512 px on the long side
+    wm=(bbox[2]-bbox[0])*111320*math.cos(math.radians((bbox[1]+bbox[3])/2)); hm=(bbox[3]-bbox[1])*110540
+    k=min(1.0,512/max(wm/10,hm/10,1)); width=max(16,int(round(wm/10*k))); height=max(16,int(round(hm/10*k)))
+    next_month=(period.replace(day=28)+timedelta(days=4)).replace(day=1)
+    end=min(date.today(),next_month-timedelta(days=1))
+    payload={'input':{'bounds':{'bbox':bbox,'geometry':geom,'properties':{'crs':'http://www.opengis.net/def/crs/OGC/1.3/CRS84'}},
+             'data':[{'type':'sentinel-2-l2a','dataFilter':{'timeRange':{'from':period.isoformat()+'T00:00:00Z','to':end.isoformat()+'T23:59:59Z'},
+                      'mosaickingOrder':'leastCC'}}]},
+             'output':{'width':width,'height':height,'responses':[{'identifier':'default','format':{'type':'image/png'}}]},
+             'evalscript':MAP_SCRIPTS[layer]}
+    try:
+        data=_process_image(payload,_copernicus_access_token())
+    except RuntimeError as ex:
+        raise HTTPException(502,str(ex)[:300]) from ex
+    try:
+        path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+    except OSError:
+        pass
+    return Response(data,media_type='image/png',headers=hdr)
+
 LST_EVALSCRIPT = """//VERSION=3
 // Land-surface temperature (°C) from Landsat 8/9 TIRS band 10 brightness temperature (Kelvin),
 // corrected with NDVI-based emissivity (single-channel method). Cold pixels (<270 K, likely cloud) are excluded.
@@ -1341,54 +1473,28 @@ def sync_satellite(area_id:int,v:Sync,req:Request):
     with connect() as db:
         a=area_access(db,u,area_id)
         polygon=json.loads(a['geometry'])
-    bounds={'geometry':polygon,'properties':{'crs':'http://www.opengis.net/def/crs/EPSG/0/4326'}}
+    import intelligence_api as _intel
     try:
-        tok=api_json('https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token',
-            {'grant_type':'client_credentials','client_id':client_id,'client_secret':secret},
-            {'Content-Type':'application/x-www-form-urlencoded'})['access_token']
-        stat_req={'input':{'bounds':bounds,'data':[{'type':'sentinel-2-l2a','dataFilter':{'maxCloudCoverage':80,'mosaickingOrder':'mostRecent'}}]},
-                  'aggregation':{'timeRange':{'from':f'{start}T00:00:00Z','to':f'{end}T23:59:59Z'},
-                                 'aggregationInterval':{'of':'P30D'},'lastIntervalBehavior':'SHORTEN','evalscript':EVALSCRIPT,
-                                 'resx':0.0001,'resy':0.0001}}
-        results=api_json('https://sh.dataspace.copernicus.eu/statistics/v1',stat_req,
-                          {'Content-Type':'application/json','Authorization':'Bearer '+tok},timeout=90)
+        tok=_copernicus_access_token()
+        report=_intel.sync_area(area_id,start,end,tok,api_json,u['id'])
     except RuntimeError as ex:
-        raise HTTPException(502,str(ex))
-    saved=0;skipped=0
-    with connect() as db:
-        for item in results.get('data',[]):
-            outputs=item.get('outputs',{})
-            v1=outputs.get('ndvi',{}).get('bands',{}).get('B0',{}).get('stats',{})
-            v2=outputs.get('ndmi',{}).get('bands',{}).get('B0',{}).get('stats',{})
-            ext={k:outputs.get(k,{}).get('bands',{}).get('B0',{}).get('stats',{}).get('mean') for k in ('ndwi','savi','ndre','salinity')}
-            ext={k:(round(x,5) if isinstance(x,(int,float)) and math.isfinite(x) else None) for k,x in ext.items()}
-            std=v1.get('stDev');std=round(std,5) if isinstance(std,(int,float)) and math.isfinite(std) else None
-            vm=outputs.get('valid',{}).get('bands',{}).get('B0',{}).get('stats',{}).get('mean')
-            if isinstance(vm,(int,float)) and math.isfinite(vm):
-                pct=vm*100  # clear-sky share of pixels inside the park polygon
-            else:
-                count=v1.get('sampleCount',0);nodata=v1.get('noDataCount',count)
-                pct=(count-nodata)/count*100 if count else 0
-            vi=v1.get('mean');mi=v2.get('mean')
-            if not (isinstance(mi,(int,float)) and math.isfinite(mi)): mi=None
-            if not (isinstance(vi,(int,float)) and math.isfinite(vi)) or pct<60:
-                skipped+=1;continue
-            dt=item['interval']['from'][:10]
-            db.execute('''INSERT INTO observations(area_id,measured_at,ndvi,ndmi,ndwi,savi,ndre,salinity,ndvi_std,valid_pixels_pct,source,is_demo,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,'Copernicus Sentinel-2 L2A',0,?)
-                ON CONFLICT(area_id,measured_at,source) DO UPDATE SET
-                ndvi=excluded.ndvi,ndmi=excluded.ndmi,ndwi=excluded.ndwi,savi=excluded.savi,ndre=excluded.ndre,
-                salinity=excluded.salinity,ndvi_std=excluded.ndvi_std,valid_pixels_pct=excluded.valid_pixels_pct''',
-                (area_id,dt,round(vi,5),round(mi,5) if mi is not None else None,ext['ndwi'],ext['savi'],ext['ndre'],ext['salinity'],std,round(pct,1),utcnow()))
-            saved+=1
-        db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES(?,?,?,?,?)',
-                   (u['id'],'satellite_sync',str(area_id),f'{saved} periods, {skipped} excluded',utcnow()))
+        log.warning('Copernicus sync failed for area %s: %s',area_id,ex)
+        raise HTTPException(502,str(ex)[:400])
+    except ValueError as ex:
+        raise HTTPException(422,str(ex))
+    saved=report['months_saved'];skipped=report['unreliable']
     thermal_saved=0;thermal_err=None
     try:
         thermal_saved=sync_thermal(area_id,polygon,start,end,tok)
     except Exception as ex:  # thermal is optional; vegetation readings are already saved
         thermal_err=str(ex)[:200]
-    return {'thermal_intervals':thermal_saved,'thermal_error':thermal_err,'saved_intervals':saved,'excluded_intervals':skipped,'source':'Copernicus Sentinel-2 L2A','note':'Each output is one composited 30-day interval, not a single-image acquisition.'}
+    try:
+        pipeline=_intel.run_pipeline('after_sync',u['id'])
+    except Exception as ex:
+        log.exception('pipeline after sync failed');pipeline={'error':str(ex)[:200]}
+    return {'thermal_intervals':thermal_saved,'thermal_error':thermal_err,'saved_intervals':saved,'excluded_intervals':skipped,
+            'report':report,'pipeline':pipeline,'source':'Copernicus Sentinel-2 L2A',
+            'note':'One real acquisition per month (the clearest over the park), with scene IDs and pixel counts stored for audit.'}
 
 
 @app.post('/api/areas/{area_id}/scan')
@@ -1407,8 +1513,8 @@ def scan_area(area_id:int,req:Request):
             raise HTTPException(409,'An active alert already exists for this area')
         cur=db.execute('''INSERT INTO alerts(area_id,severity,reason_ar,reason_en,status,created_at)
             VALUES(?,?,?,?,?,?)''',(area_id,result['status'] if result['status'] in ('high','monitor') else 'monitor',
-              f"{ins['title_ar']} — ثقة {ins.get('confidence_ar','')} · NDVI {ins.get('change_pct')}% مقابل خط الأساس",
-              f"{ins['title_en']} — {ins['confidence']} confidence · NDVI {ins.get('change_pct')}% vs baseline",'new',utcnow()))
+              f"{ins['title_ar']} · ثقة {ins.get('confidence_ar','')} · NDVI {ins.get('change_pct')}% مقابل خط الأساس",
+              f"{ins['title_en']} · {ins['confidence']} confidence · NDVI {ins.get('change_pct')}% vs baseline",'new',utcnow()))
         db.execute('INSERT INTO activity(user_id,verb,target,details,created_at) VALUES (?,?,?,?,?)',
             (u['id'],'scan',str(area_id),f'alert {cur.lastrowid} — {result["status"]}',utcnow()))
         return {'alert_id':cur.lastrowid,'status':result['status'],'message':'Provisional alert created; field verification required'}
@@ -1476,6 +1582,9 @@ def get_photo(task_id:int,kind:str,req:Request):
     path=ROOT / 'media' / r['filename']
     if not path.is_file(): raise HTTPException(404,'Photo file missing')
     return FileResponse(path,media_type=r['mime'])
+
+import intelligence_api  # noqa: E402  (new decision / forecast / schedule endpoints)
+intelligence_api.install(sys.modules[__name__])
 
 if __name__=='__main__':
     import uvicorn
