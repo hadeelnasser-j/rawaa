@@ -15,9 +15,7 @@ CAUSES = {
     'nutrition': ('نقص تغذية', 'Nutrient deficiency'),
     'patchy_damage': ('تلف موضعي (عطل خط ري/آفة)', 'Localised damage (line break/pest)'),
     'heat_stress': ('إجهاد حراري', 'Heat stress'),
-    'maintenance': ('أثر صيانة مجدولة', 'Scheduled maintenance effect'),
-    'healthy': ('سليمة / لا مشكلة', 'Healthy / no issue'),
-    'other': ('سبب آخر', 'Other cause'),
+    'healthy': ('سليمة', 'Healthy'),
 }
 FEATURES = [
     ('ndvi_change_pct', 'تغير NDVI عن خط الأساس %', 'NDVI change vs baseline %'),
