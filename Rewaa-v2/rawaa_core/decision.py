@@ -25,6 +25,9 @@ STRONG_DECLINE_PCT = -20.0
 SLOPE_PER_MONTH = 0.01    # NDVI change per 30 days treated as a real trend
 
 
+BASELINE_DAYS = 760     # same-season baseline from the last ~2 years only (older years may predate a renovation)
+
+
 def _month_gap(a: int, b: int) -> int:
     d = abs(a - b) % 12
     return min(d, 12 - d)
@@ -38,7 +41,7 @@ def expected_value(series, idx):
     d = date.fromisoformat(reading_date(series[idx]))
     earlier = series[:idx]
     same = [r['ndvi'] for r in earlier
-            if (d - date.fromisoformat(reading_date(r))).days > 300 and _month_gap(int(reading_date(r)[5:7]), d.month) <= 1]
+            if 300 < (d - date.fromisoformat(reading_date(r))).days <= BASELINE_DAYS and _month_gap(int(reading_date(r)[5:7]), d.month) <= 1]
     if len(same) >= 2:
         return statistics.median(same), 'seasonal', len(same)
     pool = earlier[:-1] if len(earlier) >= 4 else earlier
