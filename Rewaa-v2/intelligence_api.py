@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from rawaa_core import decision as decision_mod, forecast as forecast_mod, geo, indices, scheduler, sentinel
+from rawaa_core import decision as decision_mod, forecast as forecast_mod, geo, indices, mlforecast, scheduler, sentinel
 from rawaa_core.series import trusted_series, to_points, reading_date
 
 log = logging.getLogger('rawaa.intel')
@@ -41,14 +41,37 @@ def observations(db, area_id):
     return [dict(r) for r in db.execute(f'SELECT {OBS_COLS} FROM observations WHERE area_id=? ORDER BY measured_at', (area_id,))]
 
 
-def analyse_area(area: dict, rows: list, today: date | None = None) -> dict:
+_POOL_CACHE = {'key': None, 'pool': None}
+
+
+def ml_fit(db):
+    """Load the trusted series of every park (cached until readings or boundaries change), make sure the global
+    ML model is trained for them (in the background), and return its fitter, or None while it is not ready."""
+    if os.getenv('RAWAA_ML', '1') != '1':
+        return None
+    try:
+        r = db.execute('SELECT COUNT(*), MAX(id) FROM observations').fetchone()
+        cnt, mx = r[0], r[1]  # index access: PG rows are dicts, unpacking would yield column names
+        areas = [dict(r) for r in db.execute('SELECT id, boundary_version FROM areas ORDER BY id')]
+        key = (cnt, mx, tuple((a['id'], a.get('boundary_version') or 1) for a in areas))
+        if _POOL_CACHE['key'] != key:
+            pool = [to_points(trusted_series(observations(db, a['id']), a.get('boundary_version') or 1)) for a in areas]
+            _POOL_CACHE.update(key=key, pool=pool)
+        mlforecast.prepare(_POOL_CACHE['pool'], background=True)
+        return mlforecast.fitter()
+    except Exception:
+        log.exception('ML pool preparation failed; continuing with statistical models')
+        return None
+
+
+def analyse_area(area: dict, rows: list, today: date | None = None, ml=None) -> dict:
     today = today or _today()
     bv = area.get('boundary_version') or 1
     series = trusted_series(rows, bv)
     used_ids = {r['id'] for r in series}
     unverified = sum(1 for r in rows if r.get('origin') in ('imported', 'manual'))
     dec = decision_mod.summarize(series, area.get('boundary_status') or 'needs_review', unverified, today)
-    fc = forecast_mod.forecast(to_points(series), today)
+    fc = forecast_mod.forecast(to_points(series), today, ml_fit=ml)
     plan = scheduler.plan(dec, fc, today)
     other_boundary = sum(1 for r in rows if r.get('origin') == 'satellite' and (r.get('boundary_version') or 1) != bv)
     return {'area_id': area['id'], 'decision': dec, 'forecast': fc, 'plan': plan,
@@ -169,11 +192,12 @@ def run_pipeline(trigger='manual', user_id=None, area_ids=None):
         try:
             with core.connect() as db:
                 areas = [dict(r) for r in db.execute('SELECT * FROM areas ORDER BY id')]
+                ml = ml_fit(db)
                 for area in areas:
                     if area_ids and area['id'] not in area_ids:
                         continue
                     rows = observations(db, area['id'])
-                    res = analyse_area(area, rows)
+                    res = analyse_area(area, rows, ml=ml)
                     now = core.utcnow()
                     series = trusted_series(rows, area.get('boundary_version') or 1)
                     summary['evaluated'] += _evaluate_predictions(db, area['id'], series)
@@ -258,8 +282,9 @@ def install(app_module):
         u = core.current_user(req)
         with core.connect() as db:
             out = []
+            ml = ml_fit(db)
             for a in _scoped_areas(db, u):
-                res = analyse_area(a, observations(db, a['id']))
+                res = analyse_area(a, observations(db, a['id']), ml=ml)
                 res.pop('series', None)
                 res.update(name_ar=a['name_ar'], name_en=a['name_en'], boundary_status=a.get('boundary_status'),
                            area_m2=a.get('area_m2'), schedule=_active_schedule(db, a['id']),
@@ -275,13 +300,19 @@ def install(app_module):
         u = core.current_user(req)
         with core.connect() as db:
             a = dict(core.area_access(db, u, area_id))
-            res = analyse_area(a, observations(db, area_id))
+            res = analyse_area(a, observations(db, area_id), ml=ml_fit(db))
             res['schedule'] = _active_schedule(db, area_id)
             res['predictions'] = [dict(r) for r in db.execute('SELECT * FROM predictions WHERE area_id=? ORDER BY id DESC LIMIT 24', (area_id,))]
             res['boundary'] = {'status': a.get('boundary_status'), 'source': a.get('boundary_source'), 'version': a.get('boundary_version'),
                                'area_m2': a.get('area_m2'), 'vegetated_area_m2': a.get('vegetated_area_m2'),
                                'reviewed_at': a.get('boundary_reviewed_at'), 'notes': a.get('boundary_notes')}
         return res
+
+    @app.get('/api/ml/status')
+    def ml_status(req: Request):
+        core.current_user(req)
+        return {**mlforecast.status(), 'model': 'RandomForestRegressor (global, all parks)', 'trees': mlforecast.N_TREES,
+                'features': mlforecast.FEATURE_NAMES}
 
     @app.post('/api/pipeline/run')
     def pipeline_run(v: PipelineRun, req: Request):
