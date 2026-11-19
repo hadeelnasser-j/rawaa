@@ -621,7 +621,7 @@ def build_insight(area,peers=None):
                     f"الحديقة أبرد من محيطها العمراني (حزام ~300 م) بـ {cooling:.1f}°م، والمعتاد {cm:.1f}°م. تراجع هذا الفرق يعني ضعف دور الحديقة في تلطيف الحرارة.",
                     f"Park is {cooling:.1f}°C cooler than its ~300 m surroundings (usual {cm:.1f}°C).")
     summer=month in (5,6,7,8,9,10)
-    scores={}
+    scores={};weak_dx=False
     if decline and z_lst is not None and z_lst>=1 and (z_cool is None or z_cool<=-0.5):
         scores['heat_stress']=2+(0.5 if summer else 0)+(0.5 if z_lst>=1.5 else 0)
     if decline:
@@ -630,15 +630,23 @@ def build_insight(area,peers=None):
         if zs is not None and (zs>=1 or (coastal and (sal_pct or 0)>=75)): scores['salinity']=1.5+(1 if coastal else 0)+(0.5 if zs>=1.5 else 0)
         if zc is not None and zc<=-1 and (zw is None or zw>-0.5): scores['nutrition']=2
         if zp is not None and zp>=1: scores['patchy_damage']=2+(0.5 if zp>=1.5 else 0)
-        if maint: scores['maintenance']=1.5 if not strong else 0.8
-        if not scores: scores['unexplained']=1
-        dx=max(scores,key=scores.get)
+        if scores:
+            dx=max(scores,key=scores.get)
+        elif maint and not strong:
+            dx='healthy'  # dip explained by scheduled maintenance (see note), not a problem cause
+        else:
+            # no indicator crosses 1σ: attribute to the indicator that deviates most in its cause's direction (low confidence)
+            cand={'water_stress':-zw if zw is not None else None,'waterlogging':zl,'salinity':zs,'nutrition':-zc if zc is not None else None,
+                  'patchy_damage':zp,'heat_stress':z_lst}
+            cand={k:v for k,v in cand.items() if v is not None}
+            dx=max(cand,key=cand.get) if cand else 'water_stress'
+            scores[dx]=1;weak_dx=True
     else:
-        dx='improving' if chg>=10 else 'healthy'
+        dx='healthy'
         if zp is not None and zp>=1.5 and chg<=-5: dx='patchy_damage';scores[dx]=1.5
     agree=sum(1 for e in ev if e['verdict']=='bad')
     q_valid=latest.get('valid_pixels_pct') or 0
-    conf_pts=(2 if agree>=3 else 1 if agree==2 else 0)+(1 if len(obs)>=8 else 0)-(1 if q_valid<70 else 0)-(1 if lowveg else 0)-(1 if dx in ('salinity','unexplained') else 0)
+    conf_pts=(2 if agree>=3 else 1 if agree==2 else 0)+(1 if len(obs)>=8 else 0)-(1 if q_valid<70 else 0)-(1 if lowveg else 0)-(1 if dx=='salinity' else 0)-(3 if weak_dx else 0)
     if dx in ('healthy','improving'): conf_pts+=2
     confidence='high' if conf_pts>=3 else 'medium' if conf_pts>=2 else 'low'
     conf_ar={'high':'مرتفعة','medium':'متوسطة','low':'منخفضة'}[confidence]
