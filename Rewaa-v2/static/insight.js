@@ -137,7 +137,7 @@ function modelPanel(){const m=MODEL_CACHE;if(!m)return `<div id="model-panel" cl
 function labelsModal(){const causes=MODEL_CACHE?.causes||{};openModal(`${modalHeader(ar()?'استيراد سجلات الأمانة':'Import municipality records',ar()?`الأعمدة: site (اسم الحديقة بالعربي أو الإنجليزي أو رقمها)، date (YYYY-MM-DD)، cause، notes. قيم cause المقبولة: ${Object.keys(causes).join(', ')}`:'Columns: site, date, cause, notes')}
  <form id="labels-form"><textarea name="csv_text" required style="min-height:170px">site,date,cause,notes\nحديقة الهدى,2026-06-15,water_stress,عطل في مضخة الري\nPrince Majid Park,2026-03-10,maintenance,تهوية النجيل</textarea>
  <div class="form-actions"><button type="button" class="btn" data-action="close-modal">${t('cancel')}</button><button type="submit" class="btn primary">${t('save')}</button></div></form>`)}
-const CAUSE_OPTS=[['water_stress','إجهاد مائي / نقص ري'],['waterlogging','تشبع مائي / تسرب'],['salinity','ملوحة'],['nutrition','نقص تغذية'],['patchy_damage','تلف موضعي (عطل خط ري/آفة)'],['heat_stress','إجهاد حراري'],['maintenance','أثر صيانة مجدولة'],['healthy','لا توجد مشكلة'],['other','سبب آخر']];
+const CAUSE_OPTS=[['water_stress','إجهاد مائي / نقص ري'],['waterlogging','تشبع مائي / تسرب'],['salinity','ملوحة'],['nutrition','نقص تغذية'],['patchy_damage','تلف موضعي (عطل خط ري/آفة)'],['heat_stress','إجهاد حراري'],['healthy','سليمة']];
 
 /* Plain-language information: city briefing (dashboard) and park story (area page). */
 function briefingCard(){const b=S.data?.briefing;if(!b)return '';
