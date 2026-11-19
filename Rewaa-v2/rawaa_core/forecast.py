@@ -22,6 +22,7 @@ MODEL_LABELS = {
     'drift': ('اتجاه خطي مقاوم للقيم الشاذة (Theil–Sen) مخمّد', 'Damped robust linear trend (Theil–Sen)'),
     'holt': ('تمهيد أُسّي بالاتجاه المخمّد (Holt)', 'Damped-trend exponential smoothing (Holt)'),
     'seasonal': ('نفس الموسم من العام الماضي + الانحراف الحالي', 'Same season last year + current anomaly'),
+    'ml': ('تعلّم آلي: غابة عشوائية (Random Forest) مدرّبة على كل الحدائق', 'Machine learning: global Random Forest trained on all parks'),
 }
 
 
@@ -103,15 +104,16 @@ def _fit_seasonal(pts):
 FITTERS = {'naive': _fit_naive, 'drift': _fit_drift, 'holt': _fit_holt, 'seasonal': _fit_seasonal}
 
 
-def backtest(pts, max_origins=8):
+def backtest(pts, max_origins=8, fitters=None):
     """Rolling origin: fit on pts[:i], predict pts[i]. Returns {model: [(origin_index, error)]}."""
+    fitters = fitters or FITTERS
     n = len(pts)
     start = max(4, n - max_origins)
-    errs = {k: [] for k in FITTERS}
+    errs = {k: [] for k in fitters}
     for i in range(start, n):
         hist = pts[:i]
         target_d, target_v = pts[i]
-        for name, fit in FITTERS.items():
+        for name, fit in fitters.items():
             f = fit(hist)
             if f is None:
                 continue
@@ -122,8 +124,12 @@ def backtest(pts, max_origins=8):
     return errs, list(range(start, n))
 
 
-def forecast(pts, today: date | None = None) -> dict:
+def forecast(pts, today: date | None = None, ml_fit=None) -> dict:
+    """ml_fit: optional fit(hist) from mlforecast.fitter(); it then competes like any other model."""
     today = today or date.today()
+    fitters = dict(FITTERS)
+    if ml_fit is not None:
+        fitters['ml'] = ml_fit
     n = len(pts)
     if n < MIN_POINTS:
         return {'available': False, 'kind': 'forecast', 'n': n,
@@ -135,7 +141,7 @@ def forecast(pts, today: date | None = None) -> dict:
         return {'available': False, 'kind': 'forecast', 'n': n,
                 'reason_ar': f'آخر قراءة موثوقة عمرها {stale} يومًا؛ التوقع من بيانات قديمة غير موثوق. اجلبوا قراءات أحدث.',
                 'reason_en': f'Latest trusted reading is {stale} days old; refresh satellite data before forecasting.'}
-    errs, origins = backtest(pts)
+    errs, origins = backtest(pts, fitters=fitters)
     naive_by_origin = dict(errs['naive'])
     board = []
     for name, e in errs.items():
@@ -156,7 +162,7 @@ def forecast(pts, today: date | None = None) -> dict:
     for b in board:  # best skill first; a model that cannot be fitted on the full series is skipped
         if b['skill_pct'] <= 0:
             break
-        f = FITTERS[b['model']](pts)
+        f = fitters[b['model']](pts)
         if f is not None:
             best = b
             break
