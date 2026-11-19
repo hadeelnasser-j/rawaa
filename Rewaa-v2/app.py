@@ -409,12 +409,14 @@ def in_scope_clause(user, alias='a'):
     return ('',[])
 
 
+BASELINE_DAYS=760  # baselines use the last ~2 years only: older years can predate a park's renovation
+
 def same_season(rows,latest):
     """Readings from the same time of year (±1 month) in earlier years; used once 24+ months exist,
     so a normal summer dip is not mistaken for decline."""
     if len(rows)<24: return []
     lm=int(latest['measured_at'][5:7]);ld=date.fromisoformat(latest['measured_at'])
-    out=[r for r in rows if (ld-date.fromisoformat(r['measured_at'])).days>300 and min((int(r['measured_at'][5:7])-lm)%12,(lm-int(r['measured_at'][5:7]))%12)<=1]
+    out=[r for r in rows if 300<(ld-date.fromisoformat(r['measured_at'])).days<=BASELINE_DAYS and min((int(r['measured_at'][5:7])-lm)%12,(lm-int(r['measured_at'][5:7]))%12)<=1]
     return out if len(out)>=2 else []
 
 def metrics(area_id, db):
@@ -437,7 +439,7 @@ def metrics_from_rows(rows):
                 'source':series[-1]['source'] if series else None,'observations':series}
     latest=quality[-1]
     season=same_season(quality,latest)
-    base=statistics.median([r['ndvi'] for r in season]) if season else statistics.median([r['ndvi'] for r in quality[:-2]])
+    base=statistics.median([r['ndvi'] for r in season]) if season else statistics.median([r['ndvi'] for r in quality[-26:-2]])
     change_pct=(latest['ndvi']-base)/abs(base)*100 if base else None
     last2=[(r['ndvi']-base)/abs(base)*100 for r in quality[-2:]] if base else [0,0]
     if all(x<=-20 for x in last2): status='high'
@@ -564,7 +566,7 @@ def build_insight(area,peers=None):
           forecast={'available':False,'reason_ar':'لا توجد قراءات كافية.','reason_en':'Not enough readings.'},recommendations=[],data_quality={'n':len(obs)},risk_score=0,
           maintenance_plan=maintenance_engine(tree_type=area.get('plants') or None,diagnosis='insufficient',confidence='Low',month=datetime.now(timezone.utc).month).to_dict())
         return res
-    hist=obs[:-2] if len(obs)>=4 else obs[:-1];latest=obs[-1];prev=obs[-2]
+    hist=obs[-26:-2] if len(obs)>=4 else obs[:-1];latest=obs[-1];prev=obs[-2]
     _ss=same_season(obs,latest)
     if len(_ss)>=3: hist=_ss
     refs={k:_ref(hist,k) for k in _FLOOR}
